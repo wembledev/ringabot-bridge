@@ -13,11 +13,12 @@ from typing import Protocol
 
 
 def ct_eq(left: bytes, right: bytes) -> bool:
-    """Constant-time equality. Unequal lengths still run a compare."""
-    if len(left) != len(right):
-        hmac.compare_digest(hashlib.sha256(left).digest(), hashlib.sha256(right).digest())
-        return False
-    return hmac.compare_digest(left, right)
+    """Equality check that does not branch on length or secret bytes.
+
+    Both sides are hashed to a fixed 32-byte digest first, so a shorter
+    guess does not take a faster path than the real token.
+    """
+    return hmac.compare_digest(hashlib.sha256(left).digest(), hashlib.sha256(right).digest())
 
 
 class Authenticator(Protocol):
@@ -30,18 +31,25 @@ class StaticBearerAuth:
 
     def __init__(self, token: str, tenant_id: str = "local") -> None:
         self._token = token.encode("utf-8")
+        self._digest = hashlib.sha256(self._token).digest()
         self._tenant_id = tenant_id
 
     def authenticate(self, authorization_header: str | None) -> str | None:
         presented = _bearer_bytes(authorization_header)
-        if presented is None or not self._token:
+        # Always hash something so a missing header is not a faster reject.
+        digest = hashlib.sha256(presented if presented is not None else b"").digest()
+        if not self._token or presented is None:
+            hmac.compare_digest(digest, self._digest)
             return None
-        if ct_eq(presented, self._token):
+        if hmac.compare_digest(digest, self._digest):
             return self._tenant_id
         return None
 
     def check_token(self, presented: str) -> bool:
         return ct_eq(presented.encode("utf-8"), self._token)
+
+
+_MAX_BEARER = 512
 
 
 def _bearer_bytes(header: str | None) -> bytes | None:
@@ -50,4 +58,7 @@ def _bearer_bytes(header: str | None) -> bytes | None:
     scheme, _, rest = header.partition(" ")
     if scheme.lower() != "bearer" or not rest.strip():
         return None
-    return rest.strip().encode("utf-8")
+    token = rest.strip().encode("utf-8")
+    if len(token) > _MAX_BEARER:
+        return None
+    return token

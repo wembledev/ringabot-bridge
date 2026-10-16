@@ -53,39 +53,50 @@ class WebhookVerifier:
         lowered = {key.lower(): value for key, value in headers.items()}
         bearer_ok = self._bearer_ok(lowered.get("authorization"))
         has_sig = SIGNATURE_HEADER in lowered or TIMESTAMP_HEADER in lowered
-        hmac_ok = self._hmac_ok(lowered, body) if has_sig else False
-        if has_sig and lowered.get("authorization"):
-            return bearer_ok or hmac_ok
-        if lowered.get("authorization"):
-            return bearer_ok
-        if has_sig:
-            return hmac_ok
-        return False
+        hmac_ok = self._hmac_ok(lowered, body) if has_sig else self._dummy_hmac(body)
+        return bearer_ok or hmac_ok
 
     def _bearer_ok(self, header: str | None) -> bool:
-        if not header or not self._bearer:
+        presented = b""
+        if header:
+            scheme, _, rest = header.partition(" ")
+            if scheme.lower() == "bearer":
+                presented = rest.strip().encode("utf-8")
+        if len(presented) > 512:
+            presented = b""
+        if not self._bearer:
+            ct_eq(presented, b"")
             return False
-        scheme, _, rest = header.partition(" ")
-        if scheme.lower() != "bearer":
-            return False
-        return ct_eq(rest.strip().encode("utf-8"), self._bearer)
+        return ct_eq(presented, self._bearer)
+
+    def _dummy_hmac(self, body: bytes) -> bool:
+        """Spend the same MAC work when the caller sent no signature headers."""
+        expected = hmac.new(self._secret, _signed_payload("0", body), hashlib.sha256).digest()
+        ct_eq(b"", expected)
+        return False
 
     def _hmac_ok(self, headers: Mapping[str, str], body: bytes) -> bool:
         stamp = headers.get(TIMESTAMP_HEADER, "")
-        presented = _decode_signature(headers.get(SIGNATURE_HEADER, ""))
+        signature = headers.get(SIGNATURE_HEADER, "")
+        if len(stamp) > 16 or len(signature) > 80:
+            self._dummy_hmac(body)
+            return False
+        presented = _decode_signature(signature)
         expected = hmac.new(self._secret, _signed_payload(stamp, body), hashlib.sha256).digest()
         match = bool(self._secret) and ct_eq(presented, expected)
-        if not _timestamp_fresh(stamp, self._now(), self.window):
+        fresh = _timestamp_fresh(stamp, self._now(), self.window)
+        if not fresh or not match:
             return False
-        if not match:
-            return False
-        return self._remember(stamp, headers.get(SIGNATURE_HEADER, ""))
+        return self._remember(stamp, signature)
 
     def _remember(self, stamp: str, signature: str) -> bool:
         now = self._now()
         cutoff = now - self.window
-        if len(self._seen) > self._max_seen:
+        if len(self._seen) > 256:
             self._seen = {key: exp for key, exp in self._seen.items() if exp >= cutoff}
+        if len(self._seen) > self._max_seen:
+            oldest = sorted(self._seen.items(), key=lambda item: item[1])
+            self._seen = dict(oldest[-self._max_seen :])
         key = f"{stamp}:{signature}"
         if key in self._seen:
             return False

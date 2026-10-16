@@ -26,6 +26,17 @@ def test_hmac_accepts_fresh_signature_and_rejects_tamper_and_replay():
     assert not verifier.verify(tampered, b'{"event":"tool","note":"changed"}')
 
 
+def test_oversized_signature_headers_are_rejected():
+    verifier = _verifier()
+    body = b"{}"
+    headers = verifier.sign(body, timestamp="1700000000")
+    headers["X-Ringabot-Timestamp"] = "1" * 40
+    assert not verifier.verify(headers, body)
+    headers = verifier.sign(body, timestamp="1700000000")
+    headers["X-Ringabot-Signature"] = "v1=" + ("ab" * 80)
+    assert not verifier.verify(headers, body)
+
+
 def test_timestamp_window():
     verifier = _verifier()
     body = b"{}"
