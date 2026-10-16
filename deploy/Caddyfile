@@ -1,0 +1,5 @@
+# Automatic TLS. The API stays on loopback.
+# Caddy substitutes {$PUBLIC_HOSTNAME}. Example: phone.example.com
+{$PUBLIC_HOSTNAME:localhost} {
+	reverse_proxy 127.0.0.1:8787
+}
