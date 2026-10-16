@@ -18,6 +18,7 @@ from ringabot.call import CallService, probe_register
 from ringabot.config import Settings
 from ringabot.limits import LimitError
 from ringabot.mcp import handle_mcp
+from ringabot.outbound import make_client
 from ringabot.probes import validate_xai_key
 from ringabot.records import enforce_retention
 from ringabot.redact import install_logging
@@ -76,18 +77,25 @@ def create_app(
         bearer_token=settings.api_token,
         window_seconds=settings.webhook_replay_window,
     )
+    http_client = make_client()
     if webhook_client is None:
         webhook_client = WebhookClient(
             settings.tools_webhook_url,
             verifier,
             timeout=settings.webhook_timeout,
+            client=http_client,
         )
     if call_service is None:
         call_service = CallService(settings, store, webhook_client)
     if setup is None:
 
         async def key_probe(api_key: str) -> tuple[bool, str]:
-            return await validate_xai_key(settings.xai_api_base, api_key, transport=key_transport)
+            return await validate_xai_key(
+                settings.xai_api_base,
+                api_key,
+                client=None if key_transport is not None else http_client,
+                transport=key_transport,
+            )
 
         setup = SetupService(
             settings,
@@ -105,6 +113,7 @@ def create_app(
         yield
         for task in list(call_service.tasks.values()):
             task.cancel()
+        await http_client.aclose()
 
     app = Starlette(
         routes=[

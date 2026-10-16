@@ -107,6 +107,8 @@ The opening line is the AI disclosure, then your greeting if you set one. After 
 
 Optional. Set `TOOLS_WEBHOOK_URL` and `TOOLS_WEBHOOK_SECRET` to your own backend. The bridge POSTs JSON when the model calls `notify_backend`, and again with `call.completed`. There is no queue in the middle.
 
+The URL is resolved again at send time. It must be `http` or `https` with no userinfo, and every address it returns has to be a public unicast address. Loopback, private, link-local, and cloud-metadata targets are refused, and the TCP connection is pinned to an address that passed that check. Redirects are not followed. The process keeps one shared HTTP client with a short timeout and stops reading a response after 64 KiB.
+
 Each outbound request has:
 
 - `X-Ringabot-Timestamp`: unix seconds

@@ -17,6 +17,13 @@ from collections.abc import Mapping
 import httpx
 
 from ringabot.auth import ct_eq
+from ringabot.outbound import (
+    SsrfError,
+    make_client,
+    parse_outbound_url,
+    request_checked,
+    stream_request,
+)
 
 SIGNATURE_HEADER = "x-ringabot-signature"
 TIMESTAMP_HEADER = "x-ringabot-timestamp"
@@ -112,11 +119,26 @@ class WebhookClient:
         *,
         timeout: float = 2.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        client: httpx.AsyncClient | None = None,
+        resolver=None,
     ) -> None:
         self.url = url
         self.verifier = verifier
-        self.timeout = timeout
-        self._transport = transport
+        self.timeout = min(max(timeout, 0.1), 5.0)
+        self._resolver = resolver
+        # An injected transport is the test double. It does not dial the network,
+        # so DNS pinning runs only when a resolver is supplied or this is production.
+        self._injected = transport is not None
+        if client is not None:
+            self._client = client
+            self._owns_client = False
+        else:
+            self._client = make_client(transport)
+            self._owns_client = True
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
 
     async def post(self, payload: dict) -> dict:
         if not self.url:
@@ -124,13 +146,35 @@ class WebhookClient:
         body = _canonical(payload)
         headers = self.verifier.sign(body)
         try:
-            async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout) as client:
-                response = await client.post(self.url, content=body, headers=headers)
-        except httpx.TimeoutException:
+            if self._injected and self._resolver is None:
+                parse_outbound_url(self.url)
+                status, within_cap = await stream_request(
+                    self._client,
+                    "POST",
+                    self.url,
+                    content=body,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+            else:
+                status, within_cap = await request_checked(
+                    self._client,
+                    "POST",
+                    self.url,
+                    content=body,
+                    headers=headers,
+                    timeout=self.timeout,
+                    resolver=self._resolver,
+                )
+        except SsrfError:
+            return {"ok": False, "error": "blocked_url"}
+        except TimeoutError:
             return {"ok": False, "error": "timeout"}
-        except httpx.HTTPError:
+        except (ConnectionError, OSError):
             return {"ok": False, "error": "network"}
-        return {"ok": response.status_code < 300, "status": response.status_code}
+        if not within_cap:
+            return {"ok": False, "error": "response_too_large"}
+        return {"ok": status < 300, "status": status}
 
 
 def _canonical(payload: dict) -> bytes:
