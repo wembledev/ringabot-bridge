@@ -26,7 +26,10 @@ def load_persona_file(path: str) -> dict:
     file = Path(path)
     if not file.is_file():
         return {}
-    data = yaml.safe_load(file.read_text(encoding="utf-8")) or {}
+    raw = file.read_text(encoding="utf-8")
+    if len(raw) > 65536:
+        raise ValueError("persona file is too large")
+    data = yaml.safe_load(raw) or {}
     if not isinstance(data, dict):
         raise ValueError("persona file must be a mapping")
     return {str(key): str(value) for key, value in data.items() if value is not None}

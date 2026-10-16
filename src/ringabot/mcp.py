@@ -116,20 +116,37 @@ def tool_specs() -> list[dict]:
     ]
 
 
+async def read_limited(request: Request, limit: int = 65536) -> bytes | None:
+    """Read the body, but stop once it passes the cap so it cannot fill RAM."""
+    size = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def handle_mcp(request: Request, tools: dict[str, ToolFn], read_resource) -> Response:
     if request.method == "GET":
         return JSONResponse({"error": "method_not_allowed"}, status_code=405)
     if request.method == "DELETE":
         return Response(status_code=204)
+    raw = await read_limited(request)
+    if raw is None:
+        return JSONResponse({"error": "too_large"}, status_code=413)
     try:
-        message = await request.json()
-    except Exception:
+        message = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
         return _rpc_error(None, -32700, "parse error")
     if not isinstance(message, dict):
         return _rpc_error(None, -32600, "invalid request")
     method = message.get("method")
     msg_id = message.get("id")
     params = message.get("params") or {}
+    if not isinstance(params, dict):
+        return _rpc_error(msg_id, -32600, "invalid request")
     if not isinstance(method, str):
         return _rpc_error(msg_id, -32600, "invalid request")
     if method.startswith("notifications/"):
@@ -153,6 +170,8 @@ async def handle_mcp(request: Request, tools: dict[str, ToolFn], read_resource) 
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            return _rpc_error(msg_id, -32602, "invalid arguments")
         if name not in tools:
             return _rpc_error(msg_id, -32602, "unknown tool")
         try:

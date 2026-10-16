@@ -135,6 +135,13 @@ async def test_hangup_and_limits(app, monkeypatch):
         json={"number": "+1911", "briefing": "Nope."},
     )
     assert emergency.json()["error"] == "emergency_not_allowed"
+    questions = await client.post(
+        "/call",
+        headers=headers,
+        json={"number": "+15555550100", "briefing": "Nope.", "questions": "When?"},
+    )
+    assert questions.status_code == 400
+    assert questions.json()["error"] == "questions_invalid"
     first = await client.post(
         "/call",
         headers=headers,

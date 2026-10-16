@@ -31,14 +31,28 @@ def _int(name: str, default: int) -> int:
     raw = _raw(name)
     if not raw:
         return default
-    return int(raw)
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer") from exc
 
 
 def _float(name: str, default: float) -> float:
     raw = _raw(name)
     if not raw:
         return default
-    return float(raw)
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number") from exc
+
+
+def _clamp_int(name: str, default: int, low: int, high: int) -> int:
+    return max(low, min(_int(name, default), high))
+
+
+def _clamp_float(name: str, default: float, low: float, high: float) -> float:
+    return max(low, min(_float(name, default), high))
 
 
 def _on(name: str, default: bool = False) -> bool:
@@ -136,12 +150,12 @@ def load_settings() -> Settings:
         persona_instructions=_raw("PERSONA_INSTRUCTIONS"),
         persona_file=_raw("PERSONA_FILE"),
         greeting=_raw("GREETING"),
-        idle_timeout=_float("IDLE_TIMEOUT", 25),
-        max_call_seconds=_int("MAX_CALL_SECONDS", 600),
+        idle_timeout=_clamp_float("IDLE_TIMEOUT", 25, 0.2, 120),
+        max_call_seconds=_clamp_int("MAX_CALL_SECONDS", 600, 30, 1800),
         tools_webhook_url=_raw("TOOLS_WEBHOOK_URL"),
         tools_webhook_secret=_raw("TOOLS_WEBHOOK_SECRET"),
-        webhook_replay_window=_int("WEBHOOK_REPLAY_WINDOW_SECONDS", 300),
-        webhook_timeout=_float("WEBHOOK_TIMEOUT_SECONDS", 2),
+        webhook_replay_window=_clamp_int("WEBHOOK_REPLAY_WINDOW_SECONDS", 300, 30, 900),
+        webhook_timeout=_clamp_float("WEBHOOK_TIMEOUT_SECONDS", 2, 0.2, 5),
         api_token=_raw("API_TOKEN"),
         master_key=master_key_from_env(),
         public_hostname=_raw("PUBLIC_HOSTNAME"),
@@ -149,13 +163,13 @@ def load_settings() -> Settings:
         recordings=_on("RECORDINGS", False),
         retention_days=_int("RETENTION_DAYS", 30),
         allowed_destinations=prefixes,
-        max_calls_per_day=_int("MAX_CALLS_PER_DAY", 20),
-        max_concurrent_calls=_int("MAX_CONCURRENT_CALLS", 4),
+        max_calls_per_day=_clamp_int("MAX_CALLS_PER_DAY", 20, 1, 500),
+        max_concurrent_calls=_clamp_int("MAX_CONCURRENT_CALLS", 4, 1, 4),
         host=_raw("HOST") or "127.0.0.1",
         port=_int("PORT", 8787),
         data_dir=Path(_raw("DATA_DIR") or "./data"),
         log_level=_raw("LOG_LEVEL") or "INFO",
-        rate_limit_per_minute=_int("RATE_LIMIT_PER_MINUTE", 60),
+        rate_limit_per_minute=_clamp_int("RATE_LIMIT_PER_MINUTE", 60, 1, 600),
         audio_mode=audio_mode,
         sip_ctrl=_raw("SIP_CTRL"),
         env_file=Path(env_path) if env_path else None,

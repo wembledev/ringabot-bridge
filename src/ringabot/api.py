@@ -17,7 +17,7 @@ from ringabot.auth import StaticBearerAuth
 from ringabot.call import CallService, probe_register
 from ringabot.config import Settings
 from ringabot.limits import LimitError
-from ringabot.mcp import handle_mcp
+from ringabot.mcp import handle_mcp, read_limited
 from ringabot.outbound import make_client
 from ringabot.probes import validate_xai_key
 from ringabot.records import enforce_retention
@@ -36,6 +36,7 @@ _HTTP = {
     "briefing_too_long": 400,
     "questions_invalid": 400,
     "max_minutes_too_small": 400,
+    "max_minutes_invalid": 400,
     "invalid_did": 400,
     "not_configured": 409,
     "tenant_busy": 409,
@@ -52,8 +53,15 @@ class RateLimiter:
     def allow(self, key: str) -> bool:
         if self.per_minute <= 0:
             return True
+        key = (key or "unknown")[:64]
         now = asyncio.get_running_loop().time()
         window = [stamp for stamp in self._hits.get(key, []) if now - stamp < 60]
+        if key not in self._hits and len(self._hits) >= 512:
+            oldest = min(
+                self._hits,
+                key=lambda item: self._hits[item][-1] if self._hits[item] else 0,
+            )
+            self._hits.pop(oldest, None)
         if len(window) >= self.per_minute:
             self._hits[key] = window
             return False
@@ -293,6 +301,8 @@ async def mcp(request: Request) -> Response:
     async def wipe(arguments: dict) -> dict:
         if arguments.get("confirm") is not True:
             return {"ok": False, "error": "confirm_required"}
+        for call_id in request.app.state.store.active_call_ids(tenant):
+            request.app.state.calls.hangup(tenant, call_id)
         return request.app.state.setup.delete_account(tenant)
 
     async def read_resource(uri: str | None):
@@ -337,8 +347,8 @@ async def webhook(request: Request) -> Response:
         return JSONResponse(
             {"error": "rate_limited"}, status_code=429, headers={"Retry-After": "30"}
         )
-    body = await request.body()
-    if len(body) > 65536:
+    body = await read_limited(request)
+    if body is None:
         return JSONResponse({"error": "too_large"}, status_code=413)
     if not request.app.state.verifier.verify(request.headers, body):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -348,13 +358,27 @@ async def webhook(request: Request) -> Response:
         return JSONResponse({"error": "bad_json"}, status_code=400)
     if not isinstance(payload, dict):
         return JSONResponse({"error": "bad_json"}, status_code=400)
+    jobs: list[asyncio.Task] = request.app.state.webhook_jobs
+    jobs[:] = [job for job in jobs if not job.done()]
+    if len(jobs) >= 32:
+        return JSONResponse(
+            {"error": "rate_limited"}, status_code=429, headers={"Retry-After": "30"}
+        )
     custom = getattr(request.app.state, "webhook_handler", None)
     if custom is not None:
         task = asyncio.create_task(custom(payload))
     else:
         task = asyncio.create_task(_handle_webhook(request.app, payload))
-    request.app.state.webhook_jobs.append(task)
+    jobs.append(task)
+    task.add_done_callback(lambda done, pending=jobs: _drop_job(pending, done))
     return JSONResponse({"ok": True}, status_code=202)
+
+
+def _drop_job(jobs: list[asyncio.Task], task: asyncio.Task) -> None:
+    try:
+        jobs.remove(task)
+    except ValueError:
+        pass
 
 
 async def _handle_webhook(app, payload: dict) -> None:
@@ -363,7 +387,7 @@ async def _handle_webhook(app, payload: dict) -> None:
     if action == "hangup" and call_id:
         app.state.calls.hangup("local", call_id)
     elif action == "note" and call_id and payload.get("text"):
-        app.state.store.add_transcript(call_id, "system", str(payload["text"]))
+        app.state.store.add_transcript(call_id, "system", str(payload["text"])[:2000])
 
 
 def _tenant(request: Request) -> str | Response:
@@ -382,13 +406,13 @@ def _client(request: Request) -> str:
     if peer in {"127.0.0.1", "::1"}:
         forwarded = request.headers.get("x-forwarded-for", "")
         if forwarded:
-            return forwarded.split(",")[0].strip()
-    return peer
+            peer = forwarded.split(",")[0].strip() or peer
+    return peer[:64]
 
 
 async def _json(request: Request) -> dict | Response:
-    body = await request.body()
-    if len(body) > 65536:
+    body = await read_limited(request)
+    if body is None:
         return JSONResponse({"error": "too_large"}, status_code=413)
     try:
         payload = json.loads(body) if body else {}
@@ -440,6 +464,8 @@ def _since(value) -> str | None:
     if value is None or value == "":
         return None
     text = str(value)
+    if len(text) > 40:
+        return None
     if text.isdigit():
         return datetime.fromtimestamp(int(text), tz=UTC).isoformat()
     return text

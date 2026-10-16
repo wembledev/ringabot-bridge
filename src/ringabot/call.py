@@ -63,7 +63,14 @@ class CallService:
             raise LimitError("briefing_required")
         if len(briefing) > 4000:
             raise LimitError("briefing_too_long")
-        asked = [item.strip() for item in (questions or []) if item and item.strip()]
+        if questions is None:
+            asked = []
+        elif not isinstance(questions, list) or any(
+            not isinstance(item, str) for item in questions
+        ):
+            raise LimitError("questions_invalid")
+        else:
+            asked = [item.strip() for item in questions if item.strip()]
         if len(asked) > 8 or any(len(item) > 300 for item in asked):
             raise LimitError("questions_invalid")
         destination = normalize_destination(number, self.settings.allowed_destinations)
@@ -73,8 +80,13 @@ class CallService:
         cap = self.settings.max_call_seconds
         if max_minutes is None:
             max_seconds = cap
+        elif isinstance(max_minutes, bool) or not isinstance(max_minutes, (int, float)):
+            raise LimitError("max_minutes_invalid")
         else:
-            requested = int(max_minutes * 60)
+            try:
+                requested = int(max_minutes * 60)
+            except (OverflowError, ValueError) as exc:
+                raise LimitError("max_minutes_invalid") from exc
             if requested < 30:
                 raise LimitError("max_minutes_too_small")
             max_seconds = min(requested, cap)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -9,6 +10,8 @@ from ringabot.config import Settings
 from ringabot.credentials import resolve_credentials
 from ringabot.sip import SipError, safe_token
 from ringabot.store import Store
+
+_DID = re.compile(r"^\+\d{8,15}$")
 
 RegisterProbe = Callable[..., Awaitable[tuple[bool, str]]]
 KeyProbe = Callable[[str], Awaitable[tuple[bool, str]]]
@@ -31,6 +34,8 @@ class SetupService:
     async def connect_number(
         self, tenant: str, *, server: str, sip_user: str, sip_password: str, did: str
     ) -> dict:
+        if len(server) > 253 or len(sip_user) > 80 or len(sip_password) > 128 or len(did) > 16:
+            return {"ok": False, "error": "field_too_long"}
         try:
             safe_token(server, "sip_server")
             safe_token(sip_user, "sip_user")
@@ -38,7 +43,7 @@ class SetupService:
             safe_token(did.lstrip("+"), "did")
         except SipError as exc:
             return {"ok": False, "error": str(exc)}
-        if not did.startswith("+"):
+        if not _DID.fullmatch(did):
             return {"ok": False, "error": "invalid_did"}
         self.store.put_secret(tenant, "sip_password", sip_password)
         self.store.put_setting(tenant, "voipms_sip_server", server)
@@ -70,6 +75,13 @@ class SetupService:
     ) -> dict:
         if not xai_api_key or not persona_name or not instructions:
             return {"ok": False, "error": "missing_fields"}
+        if (
+            len(xai_api_key) > 200
+            or len(persona_name) > 80
+            or len(instructions) > 4000
+            or (voice is not None and len(voice) > 32)
+        ):
+            return {"ok": False, "error": "field_too_long"}
         valid, detail = await self.key_probe(xai_api_key)
         if not valid:
             return {"ok": False, "error": "xai_key_rejected", "detail": detail}

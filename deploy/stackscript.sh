@@ -147,6 +147,10 @@ chown ringabot:ringabot /etc/ringabot/ringabot.env
 chmod 0600 /etc/ringabot/ringabot.env
 
 if [[ -n "${public_hostname:-}" ]]; then
+  if [[ ! "${public_hostname}" =~ ^[A-Za-z0-9.-]+$ ]]; then
+    echo "invalid public_hostname" >&2
+    exit 1
+  fi
   api_url="https://${public_hostname}/mcp"
   cat > /etc/caddy/Caddyfile <<EOF
 ${public_hostname} {

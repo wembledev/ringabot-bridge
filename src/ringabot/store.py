@@ -10,6 +10,8 @@ from pathlib import Path
 
 from ringabot.crypto import decrypt, encrypt
 
+_CALL_FIELDS = frozenset({"status", "started_at", "ended_at", "end_reason", "summary", "error"})
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS secrets (
     tenant_id TEXT NOT NULL,
@@ -82,11 +84,20 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=2000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
-        self._conn.commit()
-        os.chmod(path, 0o600)
+        self._commit()
 
     def close(self) -> None:
         self._conn.close()
+
+    def _commit(self) -> None:
+        self._conn.commit()
+        self._protect()
+
+    def _protect(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{self.path}{suffix}")
+            if candidate.exists():
+                os.chmod(candidate, 0o600)
 
     def put_secret(self, tenant: str, name: str, plaintext: str) -> None:
         nonce, ciphertext = encrypt(
@@ -101,7 +112,7 @@ class Store:
             """,
             (tenant, name, nonce, ciphertext),
         )
-        self._conn.commit()
+        self._commit()
 
     def get_secret(self, tenant: str, name: str) -> str | None:
         row = self._conn.execute(
@@ -116,7 +127,7 @@ class Store:
 
     def delete_secrets(self, tenant: str) -> None:
         self._conn.execute("DELETE FROM secrets WHERE tenant_id=?", (tenant,))
-        self._conn.commit()
+        self._commit()
 
     def put_setting(self, tenant: str, key: str, value: str) -> None:
         self._conn.execute(
@@ -126,7 +137,7 @@ class Store:
             """,
             (tenant, key, value),
         )
-        self._conn.commit()
+        self._commit()
 
     def get_setting(self, tenant: str, key: str) -> str | None:
         row = self._conn.execute(
@@ -137,11 +148,11 @@ class Store:
 
     def delete_setting(self, tenant: str, key: str) -> None:
         self._conn.execute("DELETE FROM settings WHERE tenant_id=? AND key=?", (tenant, key))
-        self._conn.commit()
+        self._commit()
 
     def clear_settings(self, tenant: str) -> None:
         self._conn.execute("DELETE FROM settings WHERE tenant_id=?", (tenant,))
-        self._conn.commit()
+        self._commit()
 
     def insert_call(
         self,
@@ -170,17 +181,20 @@ class Store:
                 max_seconds,
             ),
         )
-        self._conn.commit()
+        self._commit()
 
     def update_call(self, call_id: str, **fields: str | None) -> None:
         if not fields:
             return
+        unknown = set(fields) - _CALL_FIELDS
+        if unknown:
+            raise ValueError("unknown call field")
         columns = ", ".join(f"{key}=?" for key in fields)
         self._conn.execute(
             f"UPDATE calls SET {columns} WHERE id=?",
             (*fields.values(), call_id),
         )
-        self._conn.commit()
+        self._commit()
 
     def get_call(self, tenant: str, call_id: str) -> dict | None:
         row = self._conn.execute(
@@ -207,7 +221,7 @@ class Store:
         return [_call_dict(row) for row in rows]
 
     def add_transcript(self, call_id: str, role: str, text: str) -> None:
-        cleaned = text.strip()
+        cleaned = text.strip()[:4000]
         if not cleaned:
             return
         last = self._conn.execute(
@@ -224,7 +238,7 @@ class Store:
             """,
             (call_id, seq, role, cleaned, utc_iso()),
         )
-        self._conn.commit()
+        self._commit()
 
     def transcript(self, call_id: str) -> list[dict]:
         rows = self._conn.execute(
@@ -249,7 +263,7 @@ class Store:
             """,
             (call_id, tenant, path, utc_iso()),
         )
-        self._conn.commit()
+        self._commit()
 
     def list_recordings(self, tenant: str) -> list[dict]:
         rows = self._conn.execute(
@@ -281,7 +295,7 @@ class Store:
             """,
             (tenant, stamp),
         )
-        self._conn.commit()
+        self._commit()
         return self.calls_today(tenant, stamp)
 
     def active_call_count(self, tenant: str | None = None) -> int:
@@ -301,6 +315,16 @@ class Store:
                 (tenant,),
             ).fetchone()
         return int(row["n"])
+
+    def active_call_ids(self, tenant: str) -> list[str]:
+        rows = self._conn.execute(
+            """
+            SELECT id FROM calls
+            WHERE tenant_id=? AND status IN ('queued', 'dialing', 'in_progress', 'wrapping_up')
+            """,
+            (tenant,),
+        ).fetchall()
+        return [str(row["id"]) for row in rows]
 
     def delete_account(self, tenant: str) -> list[str]:
         rows = self._conn.execute(
@@ -343,12 +367,12 @@ class Store:
 
     def delete_recording_row(self, call_id: str) -> None:
         self._conn.execute("DELETE FROM recordings WHERE call_id=?", (call_id,))
-        self._conn.commit()
+        self._commit()
 
     def delete_transcripts_before(self, cutoff: datetime) -> int:
         stamp = cutoff.isoformat()
         cursor = self._conn.execute("DELETE FROM transcript WHERE created_at<=?", (stamp,))
-        self._conn.commit()
+        self._commit()
         return cursor.rowcount
 
     def fail_orphans(self) -> None:
@@ -359,7 +383,7 @@ class Store:
             """,
             (utc_iso(),),
         )
-        self._conn.commit()
+        self._commit()
 
 
 def _call_dict(row: sqlite3.Row) -> dict:
