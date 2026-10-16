@@ -425,6 +425,13 @@ async def test_delete_account_wipes_rows(app):
         },
     )
     assert json.loads(denied.json()["result"]["content"][0]["text"])["error"] == "confirm_required"
+    live = await client.post(
+        "/call",
+        headers=headers,
+        json={"number": "+15555550109", "briefing": "Still on the line."},
+    )
+    live_id = live.json()["call_id"]
+    await _wait_status(app.state.store, live_id, {"in_progress"})
     wiped = await client.post(
         "/mcp",
         headers=headers,
@@ -437,3 +444,4 @@ async def test_delete_account_wipes_rows(app):
     )
     assert json.loads(wiped.json()["result"]["content"][0]["text"])["ok"] is True
     assert app.state.store.get_secret("local", "sip_password") is None
+    assert app.state.store.get_call("local", live_id) is None

@@ -301,8 +301,15 @@ async def mcp(request: Request) -> Response:
     async def wipe(arguments: dict) -> dict:
         if arguments.get("confirm") is not True:
             return {"ok": False, "error": "confirm_required"}
+        pending = []
+        calls = request.app.state.calls
         for call_id in request.app.state.store.active_call_ids(tenant):
-            request.app.state.calls.hangup(tenant, call_id)
+            calls.hangup(tenant, call_id)
+            task = calls.tasks.get(call_id)
+            if task is not None:
+                pending.append(task)
+        if pending:
+            await asyncio.wait(pending, timeout=5)
         return request.app.state.setup.delete_account(tenant)
 
     async def read_resource(uri: str | None):

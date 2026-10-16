@@ -80,6 +80,41 @@ def blocked_ip(raw: str) -> bool:
     )
 
 
+def voice_url_allowed(url: str) -> bool:
+    """Reject non-public websocket targets without a DNS lookup.
+
+    Literal loopback stays allowed so the local fake Grok socket works.
+    Names are checked for metadata-style hosts; webhook sends do the full
+    resolve-and-pin check because those URLs are the SSRF boundary.
+    """
+    try:
+        parsed = httpx.URL(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"ws", "wss"} or parsed.userinfo:
+        return False
+    host = (parsed.host or "").lower().rstrip(".")
+    if (
+        not host
+        or host in _BLOCKED_HOSTS
+        or host.endswith(".localhost")
+        or host.endswith(".local")
+        or host.endswith(".internal")
+        or host.isdigit()
+    ):
+        return False
+    literal = _literal_ip(host)
+    if literal is None:
+        return True
+    try:
+        ip = ipaddress.ip_address(literal)
+    except ValueError:
+        return False
+    if ip.is_loopback:
+        return True
+    return not blocked_ip(literal)
+
+
 def parse_outbound_url(url: str) -> tuple[str, str, int, str]:
     if not url or len(url) > 2048:
         raise SsrfError("bad_url")

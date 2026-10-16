@@ -106,7 +106,7 @@ class SipClient:
     def __init__(self, host: str, port: int) -> None:
         self.host = host
         self.port = port
-        self.events: asyncio.Queue[dict] = asyncio.Queue()
+        self.events: asyncio.Queue[dict] = asyncio.Queue(maxsize=32)
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._task: asyncio.Task | None = None
@@ -117,27 +117,43 @@ class SipClient:
 
     async def _read(self) -> None:
         assert self._reader is not None
+        buf = bytearray()
         try:
             while True:
-                line = await self._reader.readline()
-                if not line:
+                chunk = await self._reader.read(4096)
+                if not chunk:
+                    if buf:
+                        await self._emit_line(bytes(buf))
                     await self.events.put({"type": "EOF"})
                     return
-                text = line.decode("utf-8", "replace").strip()
-                if not text:
-                    continue
-                if text.startswith("{"):
-                    try:
-                        await self.events.put(json.loads(text))
-                        continue
-                    except json.JSONDecodeError:
-                        pass
-                await self.events.put({"type": "RAW", "line": text})
+                buf.extend(chunk)
+                if len(buf) > 65536 and b"\n" not in buf:
+                    await self.events.put({"type": "EOF"})
+                    return
+                while b"\n" in buf:
+                    line, _, rest = bytes(buf).partition(b"\n")
+                    buf = bytearray(rest)
+                    if len(line) > 8192:
+                        await self.events.put({"type": "EOF"})
+                        return
+                    await self._emit_line(line)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("sip read failed")
             await self.events.put({"type": "EOF"})
+
+    async def _emit_line(self, line: bytes) -> None:
+        text = line.decode("utf-8", "replace").strip()
+        if not text:
+            return
+        if text.startswith("{"):
+            try:
+                await self.events.put(json.loads(text))
+                return
+            except json.JSONDecodeError:
+                pass
+        await self.events.put({"type": "RAW", "line": text})
 
     async def command(self, line: str) -> None:
         if self._writer is None:
@@ -206,25 +222,31 @@ async def start_baresip(
         mic_device=mic_device,
         regint=regint,
     )
-    process = await asyncio.create_subprocess_exec(
-        binary,
-        "-f",
-        str(directory),
-        "-n",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    deadline = asyncio.get_running_loop().time() + 5
-    while asyncio.get_running_loop().time() < deadline:
-        try:
-            _probe_reader, probe_writer = await asyncio.open_connection("127.0.0.1", port)
-        except (ConnectionRefusedError, OSError):
+    process: asyncio.subprocess.Process | None = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            binary,
+            "-f",
+            str(directory),
+            "-n",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        deadline = asyncio.get_running_loop().time() + 5
+        while asyncio.get_running_loop().time() < deadline:
             if process.returncode is not None:
                 raise SipError("baresip_exited")
-            await asyncio.sleep(0.05)
-            continue
-        probe_writer.close()
-        await probe_writer.wait_closed()
-        return BaresipProcess(directory=directory, port=port, process=process)
-    process.kill()
-    raise SipError("baresip_ctrl_timeout")
+            try:
+                _probe_reader, probe_writer = await asyncio.open_connection("127.0.0.1", port)
+            except (ConnectionRefusedError, OSError):
+                await asyncio.sleep(0.05)
+                continue
+            probe_writer.close()
+            await probe_writer.wait_closed()
+            return BaresipProcess(directory=directory, port=port, process=process)
+        raise SipError("baresip_ctrl_timeout")
+    except Exception:
+        if process is not None and process.returncode is None:
+            process.kill()
+        shutil.rmtree(directory, ignore_errors=True)
+        raise

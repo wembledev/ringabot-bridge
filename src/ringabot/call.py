@@ -170,8 +170,14 @@ class CallService:
                     tools=tools,
                 )
             )
+            if control.stop.is_set():
+                self._cancel(call_id, control)
+                return
             await sip.command(f"dial {dial_uri(digits, creds.sip_server)}")
-            established = await sip.wait_type("CALL_ESTABLISHED", "CALL_CLOSED", timeout=20)
+            established = await _wait_established(sip, control)
+            if established.get("type") == "CANCELLED":
+                self._cancel(call_id, control)
+                return
             if established.get("type") != "CALL_ESTABLISHED":
                 raise RuntimeError("dial_failed")
             self.store.update_call(call_id, status="in_progress", started_at=utc_iso())
@@ -189,15 +195,17 @@ class CallService:
             )
             if control.reason == "failed":
                 raise RuntimeError("audio_ended")
-            if control.reason in {"idle", "max_duration", "hangup"} and voice is not None:
-                try:
-                    await asyncio.wait_for(voice.force_message(GOODBYE), timeout=3)
-                    self.store.add_transcript(call_id, "assistant", GOODBYE)
-                except Exception:
-                    log.info("goodbye skipped for %s", call_id)
+            # Drop the SIP leg before the summary so the model does not read JSON to the person.
+            try:
+                await sip.command("hangup")
+            except Exception:
+                pass
             await self._finish(call_id, tenant, voice, questions, control.reason)
         except Exception:
             log.exception("call %s failed", call_id)
+            row = self.store.get_call(tenant, call_id)
+            if row and row["status"] == "completed":
+                return
             if control.reason == "completed":
                 control.reason = "failed"
             self.store.update_call(
@@ -224,7 +232,17 @@ class CallService:
                 self._global = max(0, self._global - 1)
                 self._tenants[tenant] = max(0, self._tenants.get(tenant, 1) - 1)
             self.audios.pop(call_id, None)
+            self.controls.pop(call_id, None)
+            self.tasks.pop(call_id, None)
             enforce_retention(self.store, self.settings.retention_days)
+
+    def _cancel(self, call_id: str, control: Control) -> None:
+        self.store.update_call(
+            call_id,
+            status="cancelled",
+            end_reason=control.reason or "hangup",
+            ended_at=utc_iso(),
+        )
 
     async def _relay(
         self,
@@ -245,32 +263,58 @@ class CallService:
         voice_task = asyncio.create_task(voice.next_event())
         sip_task = asyncio.create_task(sip.events.get())
         stop_task = asyncio.create_task(control.stop.wait())
+        closing = False
+        close_at = 0.0
+        heard_goodbye = False
         try:
-            while not control.stop.is_set():
-                timeout = min(deadline, max_at) - time.monotonic()
-                if timeout <= 0:
-                    control.reason = "idle" if time.monotonic() >= deadline else "max_duration"
-                    control.stop.set()
-                    break
+            while True:
+                now = time.monotonic()
+                if closing:
+                    timeout = close_at - now
+                    if timeout <= 0:
+                        break
+                else:
+                    timeout = min(deadline, max_at) - now
+                    if timeout <= 0 or control.stop.is_set():
+                        if await self._say_goodbye(call_id, voice, control, max_at):
+                            closing = True
+                            close_at = time.monotonic() + 3
+                            if stop_task.done():
+                                stop_task = asyncio.create_task(asyncio.sleep(3600))
+                            continue
+                        break
                 done, _pending = await asyncio.wait(
                     {audio_task, voice_task, sip_task, stop_task},
                     timeout=timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if stop_task in done or control.stop.is_set():
+                if not closing and (stop_task in done or control.stop.is_set()):
+                    if await self._say_goodbye(call_id, voice, control, max_at):
+                        closing = True
+                        close_at = time.monotonic() + 3
+                        stop_task = asyncio.create_task(asyncio.sleep(3600))
+                        continue
                     break
                 if not done:
-                    control.reason = "idle" if time.monotonic() >= deadline else "max_duration"
-                    control.stop.set()
+                    if closing:
+                        break
+                    if await self._say_goodbye(call_id, voice, control, max_at):
+                        closing = True
+                        close_at = time.monotonic() + 3
+                        continue
                     break
+                if closing and stop_task in done:
+                    stop_task = asyncio.create_task(asyncio.sleep(3600))
                 if audio_task in done:
                     pcm = audio_task.result()
                     audio_task = asyncio.create_task(audio.read_remote())
                     if pcm is None:
-                        control.stop.set()
+                        if not closing and control.reason == "completed":
+                            control.reason = "failed"
                         break
                     if pcm:
-                        deadline = time.monotonic() + idle_seconds
+                        if audible(pcm) and not closing:
+                            deadline = time.monotonic() + idle_seconds
                         if recording is not None:
                             recording.write(pcm)
                         await voice.send_audio(pcm)
@@ -278,17 +322,27 @@ class CallService:
                     event = voice_task.result()
                     voice_task = asyncio.create_task(voice.next_event())
                     if event.get("type") == "_closed":
-                        control.stop.set()
+                        if control.reason == "completed":
+                            control.reason = "voice_closed"
                         break
-                    deadline = await self._on_voice(
-                        call_id, event, audio, voice, deadline, idle_seconds, seen_tools
-                    )
+                    if not closing:
+                        deadline = await self._on_voice(
+                            call_id, event, audio, voice, deadline, idle_seconds, seen_tools
+                        )
+                    else:
+                        await self._on_voice(
+                            call_id, event, audio, voice, deadline, idle_seconds, seen_tools
+                        )
+                        if event.get("type") == "response.created":
+                            heard_goodbye = True
+                        if heard_goodbye and event.get("type") == "response.done":
+                            break
                 if sip_task in done:
                     event = sip_task.result()
                     sip_task = asyncio.create_task(sip.events.get())
                     if event.get("type") in {"CALL_CLOSED", "EOF"}:
-                        control.reason = "remote_hangup"
-                        control.stop.set()
+                        if not closing:
+                            control.reason = "remote_hangup"
                         break
         finally:
             for task in (audio_task, voice_task, sip_task, stop_task):
@@ -379,16 +433,37 @@ class CallService:
             ended_at=utc_iso(),
         )
         row = self.store.get_call(tenant, call_id)
-        await self.webhooks.post(
-            {
-                "event": "call.completed",
-                "call_id": call_id,
-                "status": "completed",
-                "end_reason": reason,
-                "summary": summary,
-                "destination": row["destination"] if row else "",
-            }
-        )
+        try:
+            await self.webhooks.post(
+                {
+                    "event": "call.completed",
+                    "call_id": call_id,
+                    "status": "completed",
+                    "end_reason": reason,
+                    "summary": summary,
+                    "destination": row["destination"] if row else "",
+                }
+            )
+        except Exception:
+            log.info("completion webhook failed for %s", call_id)
+
+    async def _say_goodbye(
+        self,
+        call_id: str,
+        voice: VoiceClient,
+        control: Control,
+        max_at: float,
+    ) -> bool:
+        if control.reason == "completed":
+            control.reason = "max_duration" if time.monotonic() >= max_at else "idle"
+        if control.reason not in {"idle", "max_duration", "hangup"}:
+            return False
+        try:
+            await voice.force_message(GOODBYE)
+            self.store.add_transcript(call_id, "assistant", GOODBYE)
+        except Exception:
+            log.info("goodbye skipped for %s", call_id)
+        return True
 
     def _new_audio(self, call_id: str) -> MemoryAudio | PulseAudio:
         if self.settings.audio_mode == "memory":
@@ -423,6 +498,30 @@ class CallService:
         exc = task.exception()
         if exc is not None:
             log.error("call task %s ended with %s", call_id, type(exc).__name__)
+
+
+def audible(pcm: bytes, threshold: int = 256) -> bool:
+    """True when 16-bit PCM is louder than silence. Zeros must not hold the line open."""
+    if len(pcm) < 2:
+        return False
+    for offset in range(0, len(pcm) - 1, 2):
+        sample = int.from_bytes(pcm[offset : offset + 2], "little", signed=True)
+        if sample <= -threshold or sample >= threshold:
+            return True
+    return False
+
+
+async def _wait_established(sip: SipClient, control: Control) -> dict:
+    wait = asyncio.create_task(sip.wait_type("CALL_ESTABLISHED", "CALL_CLOSED", timeout=20))
+    stop = asyncio.create_task(control.stop.wait())
+    done, pending = await asyncio.wait({wait, stop}, return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    if wait in done:
+        return wait.result()
+    if stop in done:
+        return {"type": "CANCELLED"}
+    return {"type": "EOF"}
 
 
 def _devices(audio: MemoryAudio | PulseAudio, call_id: str) -> tuple[str, str]:

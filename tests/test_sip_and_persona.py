@@ -43,6 +43,25 @@ def test_config_file_is_private(tmp_path: Path):
     assert "placeholder-sip-pass" in accounts.read_text(encoding="utf-8")
 
 
+def test_voice_url_blocks_metadata_literals():
+    from ringabot.outbound import voice_url_allowed
+
+    assert voice_url_allowed("ws://127.0.0.1:9/v1/realtime")
+    assert voice_url_allowed("wss://api.x.ai/v1/realtime")
+    assert not voice_url_allowed("ws://169.254.169.254/latest")
+    assert not voice_url_allowed("wss://10.1.1.1/v1/realtime")
+    assert not voice_url_allowed("http://api.x.ai/v1/realtime")
+
+
+def test_silence_does_not_count_as_speech():
+    from ringabot.call import audible
+
+    assert not audible(b"")
+    assert not audible(b"\x00\x00" * 160)
+    assert not audible(b"\x01\x00" * 80)
+    assert audible(b"\x00\x10" * 4)
+
+
 def test_disclosure_cannot_be_removed(tmp_path: Path):
     persona_path = tmp_path / "persona.yaml"
     persona_path.write_text(

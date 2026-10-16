@@ -15,6 +15,7 @@ import logging
 import websockets
 
 from ringabot.audio import SAMPLE_RATE
+from ringabot.outbound import voice_url_allowed
 
 log = logging.getLogger("ringabot.bridge")
 
@@ -31,16 +32,27 @@ class VoiceClient:
     def __init__(self, url: str, api_key: str) -> None:
         self.url = url
         self.api_key = api_key
-        self.events: asyncio.Queue[dict] = asyncio.Queue()
+        self.events: asyncio.Queue[dict] = asyncio.Queue(maxsize=128)
         self._ws = None
         self._task: asyncio.Task | None = None
 
     async def connect(self) -> None:
+        if not voice_url_allowed(self.url):
+            raise RuntimeError("voice_url_blocked")
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        limits = {
+            "open_timeout": 5,
+            "close_timeout": 2,
+            "max_size": 1_048_576,
+            "max_queue": 32,
+            "ping_interval": 20,
+            "ping_timeout": 10,
+        }
         try:
-            self._ws = await websockets.connect(self.url, additional_headers=headers)
+            connector = websockets.connect(self.url, additional_headers=headers, **limits)
         except TypeError:
-            self._ws = await websockets.connect(self.url, extra_headers=headers)
+            connector = websockets.connect(self.url, extra_headers=headers, **limits)
+        self._ws = await connector
         self._task = asyncio.create_task(self._read())
 
     async def _read(self) -> None:
