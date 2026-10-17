@@ -16,6 +16,7 @@ from starlette.routing import Route
 from ringabot.auth import StaticBearerAuth
 from ringabot.call import CallService, probe_register
 from ringabot.config import Settings
+from ringabot.inbound import InboundService
 from ringabot.limits import LimitError
 from ringabot.mcp import handle_mcp, read_limited
 from ringabot.outbound import make_client
@@ -111,6 +112,8 @@ def create_app(
             register_probe=probe_register,
             key_probe=key_probe,
         )
+    inbound = InboundService(settings, store, call_service)
+    setup.inbound_view = inbound.view
     limiter = RateLimiter(settings.rate_limit_per_minute)
 
     @asynccontextmanager
@@ -118,10 +121,14 @@ def create_app(
         install_logging(settings.log_level)
         store.fail_orphans()
         enforce_retention(store, settings.retention_days)
-        yield
-        for task in list(call_service.tasks.values()):
-            task.cancel()
-        await http_client.aclose()
+        await inbound.start()
+        try:
+            yield
+        finally:
+            await inbound.stop()
+            for task in list(call_service.tasks.values()):
+                task.cancel()
+            await http_client.aclose()
 
     app = Starlette(
         routes=[
@@ -142,6 +149,7 @@ def create_app(
     app.state.store = store
     app.state.auth = auth
     app.state.calls = call_service
+    app.state.inbound = inbound
     app.state.setup = setup
     app.state.verifier = verifier
     app.state.webhook_client = webhook_client
@@ -298,6 +306,9 @@ async def mcp(request: Request) -> Response:
     async def setup_status(_arguments: dict) -> dict:
         return {"ok": True, **request.app.state.setup.status(tenant)}
 
+    async def set_inbound(arguments: dict) -> dict:
+        return await request.app.state.inbound.configure(tenant, arguments)
+
     async def wipe(arguments: dict) -> dict:
         if arguments.get("confirm") is not True:
             return {"ok": False, "error": "confirm_required"}
@@ -310,6 +321,7 @@ async def mcp(request: Request) -> Response:
                 pending.append(task)
         if pending:
             await asyncio.wait(pending, timeout=5)
+        await request.app.state.inbound.stop()
         return request.app.state.setup.delete_account(tenant)
 
     async def read_resource(uri: str | None):
@@ -339,6 +351,7 @@ async def mcp(request: Request) -> Response:
             "connect_number": connect,
             "link_voice_agent": link,
             "get_setup_status": setup_status,
+            "set_inbound": set_inbound,
             "place_call": place,
             "get_call": get_one,
             "list_calls": listed,
@@ -445,6 +458,7 @@ def _public_call(request: Request, row: dict) -> dict:
         "created_at": row["created_at"],
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
+        "direction": row.get("direction") or "outbound",
         "end_reason": row["end_reason"],
         "error": row["error"],
         "max_seconds": row["max_seconds"],

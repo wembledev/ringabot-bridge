@@ -78,29 +78,42 @@ class MemoryAudio:
 
 
 class PulseAudio:
-    def __init__(self, call_id: str) -> None:
+    def __init__(
+        self,
+        call_id: str,
+        *,
+        play_name: str | None = None,
+        mic_name: str | None = None,
+        manage_sinks: bool = True,
+    ) -> None:
         self.call_id = call_id
-        self.play_name, self.mic_name = sink_names(call_id)
+        if play_name and mic_name:
+            self.play_name, self.mic_name = play_name, mic_name
+        else:
+            self.play_name, self.mic_name = sink_names(call_id)
+        self.manage_sinks = manage_sinks
         self._modules: list[str] = []
         self._parec: asyncio.subprocess.Process | None = None
         self._pacat: asyncio.subprocess.Process | None = None
         self._stdout: asyncio.StreamReader | None = None
 
     async def start(self) -> None:
-        if shutil.which("pactl") is None:
-            raise AudioUnavailable("pactl is not installed")
-        for command in pulse_commands(self.play_name, self.mic_name):
-            proc = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                raise AudioUnavailable(stderr.decode("utf-8", "replace")[:200] or "pactl failed")
-            module_id = stdout.decode().strip()
-            if module_id:
-                self._modules.append(module_id)
+        if self.manage_sinks:
+            if shutil.which("pactl") is None:
+                raise AudioUnavailable("pactl is not installed")
+            for command in pulse_commands(self.play_name, self.mic_name):
+                proc = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await proc.communicate()
+                if proc.returncode != 0:
+                    detail = stderr.decode("utf-8", "replace")[:200] or "pactl failed"
+                    raise AudioUnavailable(detail)
+                module_id = stdout.decode().strip()
+                if module_id:
+                    self._modules.append(module_id)
         self._parec = await asyncio.create_subprocess_exec(
             "parec",
             "-d",
@@ -128,6 +141,9 @@ class PulseAudio:
     async def stop(self) -> None:
         await _terminate(self._parec)
         await _terminate(self._pacat)
+        if not self.manage_sinks:
+            self._modules.clear()
+            return
         for module_id in self._modules:
             proc = await asyncio.create_subprocess_exec(
                 "pactl",

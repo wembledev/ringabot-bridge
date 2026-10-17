@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS calls (
     end_reason TEXT,
     summary TEXT,
     error TEXT,
-    max_seconds INTEGER NOT NULL
+    max_seconds INTEGER NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'outbound'
 );
 CREATE TABLE IF NOT EXISTS transcript (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,10 +85,20 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=2000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        self._ensure_direction()
         self._commit()
 
     def close(self) -> None:
         self._conn.close()
+
+    def _ensure_direction(self) -> None:
+        columns = {
+            str(row["name"]) for row in self._conn.execute("PRAGMA table_info(calls)").fetchall()
+        }
+        if columns and "direction" not in columns:
+            self._conn.execute(
+                "ALTER TABLE calls ADD COLUMN direction TEXT NOT NULL DEFAULT 'outbound'"
+            )
 
     def _commit(self) -> None:
         self._conn.commit()
@@ -163,13 +174,14 @@ class Store:
         briefing: str,
         questions: list[str],
         max_seconds: int,
+        direction: str = "outbound",
     ) -> None:
         self._conn.execute(
             """
             INSERT INTO calls (
                 id, tenant_id, destination, briefing, questions_json, status,
-                created_at, max_seconds
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)
+                created_at, max_seconds, direction
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
             """,
             (
                 call_id,
@@ -179,6 +191,7 @@ class Store:
                 json.dumps(questions),
                 utc_iso(),
                 max_seconds,
+                direction if direction in {"outbound", "inbound"} else "outbound",
             ),
         )
         self._commit()
@@ -401,4 +414,5 @@ def _call_dict(row: sqlite3.Row) -> dict:
         "summary": row["summary"],
         "error": row["error"],
         "max_seconds": row["max_seconds"],
+        "direction": row["direction"] if "direction" in row.keys() else "outbound",
     }

@@ -55,6 +55,19 @@ def _clamp_float(name: str, default: float, low: float, high: float) -> float:
     return max(low, min(_float(name, default), high))
 
 
+def _csv(name: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in _raw(name).split(",") if part.strip())
+
+
+def _mode(name: str) -> str:
+    raw = _raw(name).lower()
+    if raw in {"", "off", "0", "false", "no"}:
+        return "off"
+    if raw in {"on", "1", "true", "yes"}:
+        return "on"
+    raise SystemExit(f"{name} must be on or off")
+
+
 def _on(name: str, default: bool = False) -> bool:
     raw = _raw(name).lower()
     if not raw:
@@ -87,6 +100,7 @@ class Settings:
     master_key: bytes
     public_hostname: str
     inbound_mode: str
+    inbound_allow: tuple[str, ...]
     recordings: bool
     retention_days: int
     allowed_destinations: tuple[str, ...]
@@ -134,7 +148,7 @@ def load_settings() -> Settings:
     audio_mode = (_raw("AUDIO_MODE") or "pulse").lower()
     if audio_mode not in {"pulse", "memory"}:
         raise SystemExit("AUDIO_MODE must be pulse or memory")
-    inbound = (_raw("INBOUND_MODE") or "off").lower()
+    inbound = _mode("INBOUND_MODE")
     env_path = _raw("RINGABOT_ENV_FILE")
     return Settings(
         xai_api_key=_raw("XAI_API_KEY"),
@@ -160,6 +174,7 @@ def load_settings() -> Settings:
         master_key=master_key_from_env(),
         public_hostname=_raw("PUBLIC_HOSTNAME"),
         inbound_mode=inbound,
+        inbound_allow=_csv("INBOUND_ALLOW"),
         recordings=_on("RECORDINGS", False),
         retention_days=_int("RETENTION_DAYS", 30),
         allowed_destinations=prefixes,

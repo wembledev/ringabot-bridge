@@ -15,7 +15,7 @@ from ringabot.store import Store
 HELP = """ringabot-bridge
 
   ringabot serve          start the HTTP and MCP server on 127.0.0.1
-  ringabot doctor         check the token, SIP REGISTER, xAI key, and TLS
+  ringabot doctor         check the token, SIP REGISTER, xAI key, TLS, and inbound
   ringabot doctor --offline
                           check local files only
 

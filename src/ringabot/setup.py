@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ringabot.config import Settings
 from ringabot.credentials import resolve_credentials
+from ringabot.inbound import empty_inbound
 from ringabot.sip import SipError, safe_token
 from ringabot.store import Store
 
@@ -30,6 +31,7 @@ class SetupService:
         self.store = store
         self.register_probe = register_probe
         self.key_probe = key_probe
+        self.inbound_view = lambda _tenant: empty_inbound()
 
     async def connect_number(
         self, tenant: str, *, server: str, sip_user: str, sip_password: str, did: str
@@ -116,7 +118,7 @@ class SetupService:
             "xai_key_valid": key_valid,
             "persona_name": creds.persona.name,
             "voice": creds.persona.voice,
-            "inbound": "unsupported",
+            "inbound": self.inbound_view(tenant),
             "recordings": self.settings.recordings,
             "credentials_revoked": self.store.get_setting(tenant, "credentials_revoked") == "1",
             "limits": {

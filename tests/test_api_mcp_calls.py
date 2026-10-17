@@ -44,7 +44,9 @@ async def test_health_is_open_and_status_requires_bearer(app):
     ok = await client.get("/status", headers={"authorization": "Bearer placeholder-token-value"})
     assert ok.status_code == 200
     body = ok.json()
-    assert body["inbound"] == "unsupported"
+    assert body["inbound"]["enabled"] is False
+    assert body["inbound"]["registered"] is False
+    assert body["inbound"]["allow"] == []
     assert "placeholder-sip-pass" not in ok.text
     assert "placeholder-xai-key" not in ok.text
 
@@ -214,7 +216,7 @@ async def test_mcp_tools_and_resources(app):
     assert "place_call" in names
     assert "hang_up" in names
     assert "connect_number" in names
-    assert "set_inbound" not in names
+    assert "set_inbound" in names
     note = await client.post(
         "/mcp",
         headers=headers,

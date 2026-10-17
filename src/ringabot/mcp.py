@@ -54,9 +54,34 @@ def tool_specs() -> list[dict]:
         {
             "name": "get_setup_status",
             "description": (
-                "Report whether a number and voice key are configured, plus current limits."
+                "Report whether a number and voice key are configured, inbound answering, "
+                "and current limits."
             ),
             "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "set_inbound",
+            "description": (
+                "Enable or disable auto-answer for the configured DID. Optional greeting, "
+                "instructions, and an E.164 caller allow-list. An empty allow-list answers "
+                "any caller. The assistant still opens by saying it is an AI."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": {"type": "boolean"},
+                    "greeting": {"type": "string"},
+                    "instructions": {"type": "string"},
+                    "allow": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "E.164 callers. Omit to leave unchanged. Empty allows any caller."
+                        ),
+                    },
+                },
+                "required": ["enabled"],
+            },
         },
         {
             "name": "place_call",

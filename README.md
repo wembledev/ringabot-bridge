@@ -24,14 +24,15 @@ Slow work (the call itself, webhook side effects) runs as an in-process task. `P
 | --- | --- |
 | `connect_number` | Store Voip.ms SIP settings and try a test REGISTER. The password is write-only. |
 | `link_voice_agent` | Check an xAI key with a short API call and store it encrypted. The key is write-only. |
-| `get_setup_status` | Number configured? Key checked? Current limits. |
+| `get_setup_status` | Number configured? Key checked? Inbound answering? Current limits. |
+| `set_inbound` | Enable or disable auto-answer on the DID. Optional greeting, instructions, and caller allow-list. |
 | `place_call` | One outbound call. Returns a `call_id`. |
 | `get_call` | Status, transcript, summary. |
 | `list_calls` | Recent calls. |
 | `hang_up` | End one call. |
 | `delete_account` | Wipe stored secrets, transcripts, and recordings. |
 
-`set_inbound` is not in v1. Inbound answering needs a registered user agent per number; leave `INBOUND_MODE=off`.
+`set_inbound` turns on a long-lived baresip registration (`answermode=auto`) for `VOIPMS_DID`. Inbound calls use the same AI disclosure, idle timeout, max length, goodbye, summary, daily cap, and one-active-call limit as outbound calls. Leave `INBOUND_MODE=off` until the DID is routed and `ringabot doctor` is clean.
 
 MCP is streamable HTTP at `/mcp` (POST JSON-RPC, `application/json`). `GET /mcp` returns 405. Self-host auth is a static bearer token (`API_TOKEN`), compared in constant time. Hosted OAuth 2.1 can implement the same auth interface later.
 
@@ -75,14 +76,38 @@ chown ringabot:ringabot /etc/ringabot/master.key
 Do this in your own Voip.ms account. The screens in that portal move; these are the steps, not a screenshot tour.
 
 1. Create the account and complete whatever identity checks they ask for.
-2. Order a DID. Emergency-address service on that number is between you and Voip.ms. This bridge still will not place emergency calls.
-3. Create a SIP sub-account. Note the pop hostname, the username, and the password.
-4. Route the DID to that sub-account so caller ID matches the number you bought.
-5. Put those four values in the env file, or pass them to `connect_number`.
+2. Order a DID (a phone number). Emergency-address service on that number is between you and Voip.ms. This bridge still will not place emergency calls.
+3. Create a SIP sub-account. Main account → Sub Accounts → Create Sub Account. Note the pop hostname (the SIP server), the username, and the password. Use a city pop close to the VPS.
+4. Route the DID to that sub-account. DID Numbers → Manage DIDs → the number → Routing. Choose the sub-account, not a voicemail box or an IVR. Inbound calls then land on the registered user agent. Set the DID's caller ID to the same number so outbound calls show that caller ID.
+5. Put the pop hostname, username, password, and DID (`+` and country code) in the env file, or pass them to `connect_number`.
 
 Example values in this repo use fictional `555` numbers such as `+15555550100` and hostnames like `sip.example.com`. Use the hostname Voip.ms shows you, not an example.
 
 If you deployed with the Linode StackScript, the UDF form is stored in Linode metadata. Rotate the SIP password afterwards if you do not want it to stay there. The script writes secrets only to the env file and writes the API URL plus `API_TOKEN` to `/root/ringabot-credentials.txt` (mode `0600`). It does not send them anywhere.
+
+## First test call
+
+Checklist for a fresh Linode created from `deploy/stackscript.sh`. Do the Voip.ms steps above before you expect the phone to ring.
+
+1. Deploy a Nanode (or similar) with the StackScript. Fill the UDF fields: xAI key, Voip.ms SIP server, sub-account username, sub-account password, and DID. Optional: public hostname, webhook, allowed destination prefixes.
+2. In Voip.ms, create the sub-account and route the DID to that sub-account (step 4 above). The StackScript does not click through the Voip.ms portal for you.
+3. SSH to the Linode. Confirm `/etc/ringabot/ringabot.env` is mode `0600` and owned by `ringabot`. The MCP URL and bearer token are in `/root/ringabot-credentials.txt`.
+4. Run doctor before any call. It checks the API token, the master key, the env file mode, SIP REGISTER, the xAI key, TLS, and whether inbound answering is on.
+
+   ```bash
+   sudo -u ringabot /opt/ringabot/.venv/bin/ringabot doctor
+   ```
+
+   `ringabot doctor --offline` checks local files only. Fix any line that says `fail` before you dial. A clean inbound line looks like `ok inbound enabled for +15555550100` once answering is on. While it is still off, doctor reports `ok inbound off`.
+5. Turn answering on. Either set `INBOUND_MODE=on` in the env file and `systemctl restart ringabot`, or call MCP `set_inbound` on the running server (no restart):
+
+   ```json
+   {"enabled": true, "greeting": "I have a short question.", "instructions": "Help the caller.", "allow": []}
+   ```
+
+   `allow` is optional. Leave it empty to answer any caller. Pass E.164 numbers such as `["+15555550123"]` to only answer those callers. Anyone else is hung up and is not connected to the voice agent. `get_setup_status` then shows `inbound.enabled` and `inbound.registered`.
+6. Call the DID from a phone. baresip auto-answers. The first thing spoken is the AI disclosure (and a recording clause if `RECORDINGS=on`), then the greeting. The call is stored in SQLite. When it ends, the bridge says goodbye, writes the summary, and POSTs `call.completed` if a webhook is configured. `get_call` returns the transcript.
+7. Optional outbound check: `place_call` to a number on `ALLOWED_DESTINATIONS` that is expecting you. The same disclosure, idle timeout, max length, and summary apply. Inbound and outbound share the daily cap and the one-active-call limit.
 
 ## Connect a Grok bot
 
@@ -127,8 +152,9 @@ Reject timestamps outside `WEBHOOK_REPLAY_WINDOW_SECONDS` (default 300) and reje
 
 - Destination allowlist (`ALLOWED_DESTINATIONS`, default `+1` when unset).
 - Emergency short codes are rejected.
-- Daily cap (`MAX_CALLS_PER_DAY`, default 20) per tenant.
-- One active call per tenant, and a process-wide cap (`MAX_CONCURRENT_CALLS`, default 4).
+- Daily cap (`MAX_CALLS_PER_DAY`, default 20) per tenant. Inbound answers count toward the same cap.
+- One active call per tenant, and a process-wide cap (`MAX_CONCURRENT_CALLS`, default 4). A second inbound call while a call is up is hung up.
+- Optional inbound caller allow-list (`INBOUND_ALLOW` or `set_inbound` `allow`). Empty means any caller.
 - When the cap is full the API returns `429` with `Retry-After`. It does not queue in another service.
 - Max call length (`MAX_CALL_SECONDS`, default 600).
 - A per-IP rate limit on the HTTP server.
@@ -142,7 +168,7 @@ Reject timestamps outside `WEBHOOK_REPLAY_WINDOW_SECONDS` (default 300) and reje
 
 A release tarball download requires `RINGABOT_SHA256`. Otherwise the script clones this git repo. `deploy/cloud-init.yaml` is the same shape for other clouds. `deploy/ringabot.service` sets `NoNewPrivileges`, `ProtectSystem=strict`, and `MemoryMax=800M`.
 
-`ringabot doctor` is the check after boot: SIP REGISTER, the xAI key, and TLS.
+`ringabot doctor` is the check after boot: SIP REGISTER, the xAI key, TLS, and inbound answering. See [First test call](#first-test-call).
 
 ## Development
 

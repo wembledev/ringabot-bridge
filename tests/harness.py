@@ -9,10 +9,17 @@ import json
 import websockets
 
 
+class _SipPeer:
+    def __init__(self, writer: asyncio.StreamWriter) -> None:
+        self.writer = writer
+        self.registered = False
+
+
 class FakeSipServer:
     def __init__(self) -> None:
         self.commands: list[str] = []
         self._server: asyncio.Server | None = None
+        self._peers: list[_SipPeer] = []
         self.port = 0
 
     async def start(self) -> None:
@@ -25,7 +32,27 @@ class FakeSipServer:
             self._server.close()
             await self._server.wait_closed()
 
+    async def push_incoming(self, caller: str) -> None:
+        """Auto-answer one inbound call on the registered control connection."""
+        number = caller.strip()
+        user = number[1:] if number.startswith("+") else number
+        peer = f"sip:{user}@sip.example.com"
+        body = (
+            json.dumps({"type": "CALL_INCOMING", "peeruri": peer, "param": peer})
+            + "\n"
+            + json.dumps({"type": "CALL_ESTABLISHED", "peeruri": peer})
+            + "\n"
+        ).encode()
+        for item in reversed(self._peers):
+            if item.registered and not item.writer.is_closing():
+                item.writer.write(body)
+                await item.writer.drain()
+                return
+        raise RuntimeError("no registered sip client")
+
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = _SipPeer(writer)
+        self._peers.append(peer)
         try:
             while True:
                 line = await reader.readline()
@@ -40,11 +67,16 @@ class FakeSipServer:
                 elif text == "hangup":
                     writer.write(b'{"type":"CALL_CLOSED","reason":"local"}\n')
                 elif text == "register":
+                    peer.registered = True
                     writer.write(b'{"type":"REGISTER_OK"}\n')
+                elif text == "accept":
+                    writer.write(b'{"type":"CALL_ESTABLISHED"}\n')
                 else:
                     writer.write(b'{"type":"ERROR","reason":"unknown"}\n')
                 await writer.drain()
         finally:
+            if peer in self._peers:
+                self._peers.remove(peer)
             writer.close()
 
 

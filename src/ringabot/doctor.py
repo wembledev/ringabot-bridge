@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from ringabot.config import Settings
 from ringabot.credentials import resolve_credentials
+from ringabot.inbound import inbound_enabled
 from ringabot.probes import validate_xai_key
 from ringabot.store import Store
 
@@ -37,10 +38,7 @@ async def run_doctor(
     checks.append(_master_key(settings))
     checks.append(_data_dir(settings))
     checks.append(_env_file(settings))
-    if settings.inbound_mode != "off":
-        checks.append(Check("inbound", "warn", "v1 does not answer inbound; set INBOUND_MODE=off"))
-    else:
-        checks.append(Check("inbound", "ok", "off"))
+    checks.append(_inbound(settings, store))
     checks.append(Check("recordings", "ok", "on" if settings.recordings else "off"))
     if offline:
         checks.append(Check("xai", "warn", "skipped offline"))
@@ -67,6 +65,16 @@ async def run_doctor(
     tls_ok, tls_detail = await probe_tls(settings.public_hostname)
     checks.append(Check("tls", "ok" if tls_ok else "fail", tls_detail))
     return checks
+
+
+def _inbound(settings: Settings, store: Store) -> Check:
+    if not inbound_enabled(settings, store, "local"):
+        return Check("inbound", "ok", "off")
+    creds = resolve_credentials(settings, store, "local")
+    if creds.sip_ready() and creds.voice_ready():
+        did = creds.did or "the configured DID"
+        return Check("inbound", "ok", f"enabled for {did}")
+    return Check("inbound", "fail", "enabled but SIP or voice credentials are missing")
 
 
 def _token(settings: Settings) -> Check:

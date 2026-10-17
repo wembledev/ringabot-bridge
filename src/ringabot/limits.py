@@ -21,7 +21,8 @@ class Destination:
     digits: str
 
 
-def normalize_destination(number: str, prefixes: tuple[str, ...]) -> Destination:
+def normalize_e164(number: str) -> str:
+    """E.164 with a leading plus. Emergency short codes are rejected."""
     raw = number.strip().replace(" ", "").replace("-", "").replace(".", "")
     if not raw.startswith("+"):
         raise LimitError("invalid_number")
@@ -32,7 +33,11 @@ def normalize_destination(number: str, prefixes: tuple[str, ...]) -> Destination
         raise LimitError("emergency_not_allowed")
     if not (8 <= len(digits) <= 15):
         raise LimitError("invalid_number")
-    e164 = "+" + digits
+    return "+" + digits
+
+
+def normalize_destination(number: str, prefixes: tuple[str, ...]) -> Destination:
+    e164 = normalize_e164(number)
     if not any(e164.startswith(prefix) for prefix in prefixes):
         raise LimitError("destination_not_allowed")
-    return Destination(e164=e164, digits=digits)
+    return Destination(e164=e164, digits=e164[1:])

@@ -26,6 +26,34 @@ def test_account_line_rejects_injection():
         )
 
 
+def test_inbound_account_auto_answers(tmp_path: Path):
+    write_config(
+        tmp_path / "cfg",
+        user="example-user",
+        password="placeholder-sip-pass",
+        server="sip.example.com",
+        did="+15555550100",
+        ctrl_port=4444,
+        play_device="rbinboundplay",
+        mic_device="rbinboundmic",
+        regint=60,
+        answermode="auto",
+    )
+    text = (tmp_path / "cfg" / "accounts").read_text(encoding="utf-8")
+    assert "answermode=auto" in text
+    assert "regint=60" in text
+    assert "sip:15555550100@sip.example.com" in text
+    with pytest.raises(SipError):
+        account_line(
+            user="example-user",
+            password="placeholder-sip-pass",
+            server="sip.example.com",
+            did="+15555550100",
+            regint=60,
+            answermode="early",
+        )
+
+
 def test_config_file_is_private(tmp_path: Path):
     write_config(
         tmp_path / "cfg",

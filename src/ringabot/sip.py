@@ -1,8 +1,9 @@
 """baresip runtime.
 
-Each call gets its own config directory and, unless SIP_CTRL points at an
-existing control socket, its own baresip process. Outbound INVITEs use digest
-auth. v1 does not keep a long-lived registration for inbound calls.
+Outbound calls each get a config directory and, unless SIP_CTRL points at an
+existing control socket, their own baresip process. Inbound answering uses one
+long-lived process: regint keeps the Voip.ms registration up and
+answermode=auto picks up calls to the DID.
 """
 
 from __future__ import annotations
@@ -29,14 +30,24 @@ def safe_token(value: str, field: str) -> str:
     return value
 
 
-def account_line(*, user: str, password: str, server: str, did: str, regint: int) -> str:
+def account_line(
+    *,
+    user: str,
+    password: str,
+    server: str,
+    did: str,
+    regint: int,
+    answermode: str = "manual",
+) -> str:
+    if answermode not in {"manual", "auto"}:
+        raise SipError("bad_answermode")
     user = safe_token(user, "sip_user")
     password = safe_token(password, "sip_password")
     server = safe_token(server, "sip_server")
     identity = safe_token(did.lstrip("+"), "did") if did else user
     return (
         f"<sip:{identity}@{server}>;auth_user={user};auth_pass={password};"
-        f"regint={regint};answermode=manual"
+        f"regint={regint};answermode={answermode}"
     )
 
 
@@ -51,6 +62,7 @@ def write_config(
     play_device: str,
     mic_device: str,
     regint: int,
+    answermode: str = "manual",
 ) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
@@ -75,7 +87,15 @@ def write_config(
     _write_private(directory / "config", config)
     _write_private(
         directory / "accounts",
-        account_line(user=user, password=password, server=server, did=did, regint=regint) + "\n",
+        account_line(
+            user=user,
+            password=password,
+            server=server,
+            did=did,
+            regint=regint,
+            answermode=answermode,
+        )
+        + "\n",
     )
 
 
@@ -169,12 +189,16 @@ class SipClient:
                     return event
 
     async def close(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-        if self._writer is not None:
-            self._writer.close()
+        task = self._task
+        self._task = None
+        if task is not None:
+            task.cancel()
+        writer = self._writer
+        self._writer = None
+        if writer is not None:
+            writer.close()
             try:
-                await self._writer.wait_closed()
+                await writer.wait_closed()
             except Exception:
                 pass
 
@@ -205,6 +229,7 @@ async def start_baresip(
     play_device: str,
     mic_device: str,
     regint: int,
+    answermode: str = "manual",
 ) -> BaresipProcess:
     binary = shutil.which("baresip")
     if binary is None:
@@ -221,6 +246,7 @@ async def start_baresip(
         play_device=play_device,
         mic_device=mic_device,
         regint=regint,
+        answermode=answermode,
     )
     process: asyncio.subprocess.Process | None = None
     try:

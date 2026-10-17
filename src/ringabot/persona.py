@@ -72,6 +72,7 @@ def session_instructions(
     briefing: str,
     questions: list[str],
     recordings: bool,
+    inbound: bool = False,
 ) -> str:
     question_lines = "\n".join(f"- {item}" for item in questions) or "- (none)"
     recorded = (
@@ -79,9 +80,10 @@ def session_instructions(
         if recordings
         else "Do not claim the call is being recorded."
     )
+    situation = "This is an incoming call to the user's number. " if inbound else ""
     return (
         f"You are {persona.name}, an AI voice assistant on a live phone call. "
-        f"{DISCLOSURE} Never claim to be human. Never place or forward emergency calls. "
+        f"{situation}{DISCLOSURE} Never claim to be human. Never place or forward emergency calls. "
         "If the person needs emergency help, tell them to hang up and dial their local "
         f"emergency number themselves. {recorded}\n"
         f"Additional persona notes:\n{persona.instructions}\n"

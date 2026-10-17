@@ -130,6 +130,139 @@ class CallService:
         control.stop.set()
         return True
 
+    async def accept_inbound(
+        self,
+        tenant: str,
+        *,
+        caller: str,
+        briefing: str,
+        greeting: str,
+        sip: SipClient,
+        devices: tuple[str, str] | None = None,
+    ) -> asyncio.Task | None:
+        """Start the voice session on a SIP leg baresip already answered.
+
+        The registrar keeps the control socket. This returns None when the
+        same caps that block outbound calls are already full.
+        """
+        creds = resolve_credentials(self.settings, self.store, tenant)
+        if not creds.sip_ready() or not creds.voice_ready():
+            return None
+        text = briefing.strip() or "Answer the incoming call."
+        if len(text) > 4000:
+            text = text[:4000]
+        destination = caller or "anonymous"
+        max_seconds = self.settings.max_call_seconds
+        call_id = "call_" + uuid.uuid4().hex[:16]
+        async with self._lock:
+            if self._tenants.get(tenant, 0) >= 1:
+                return None
+            if self._global >= self.settings.max_concurrent_calls:
+                return None
+            if self.store.calls_today(tenant) >= self.settings.max_calls_per_day:
+                return None
+            self.store.insert_call(
+                call_id=call_id,
+                tenant=tenant,
+                destination=destination,
+                briefing=text,
+                questions=[],
+                max_seconds=max_seconds,
+                direction="inbound",
+            )
+            self.store.increment_calls_today(tenant)
+            self._tenants[tenant] = self._tenants.get(tenant, 0) + 1
+            self._global += 1
+        control = Control()
+        self.controls[call_id] = control
+        task = asyncio.create_task(
+            self._run_inbound(call_id, tenant, creds, greeting, max_seconds, sip, devices),
+            name=call_id,
+        )
+        self.tasks[call_id] = task
+        task.add_done_callback(lambda done: self._log_task(call_id, done))
+        return task
+
+    async def _run_inbound(
+        self,
+        call_id: str,
+        tenant: str,
+        creds: Credentials,
+        greeting: str,
+        max_seconds: int,
+        sip: SipClient,
+        devices: tuple[str, str] | None,
+    ) -> None:
+        REDACTOR.add(creds.sip_password)
+        REDACTOR.add(creds.xai_api_key)
+        REDACTOR.add(self.settings.api_token)
+        REDACTOR.add(self.settings.tools_webhook_secret)
+        control = self.controls[call_id]
+        audio: MemoryAudio | PulseAudio | None = None
+        voice: VoiceClient | None = None
+        try:
+            audio = self._new_audio(call_id, devices)
+            self.audios[call_id] = audio
+            await audio.start()
+            self.store.update_call(call_id, status="in_progress", started_at=utc_iso())
+            voice = VoiceClient(self.settings.xai_realtime_endpoint, creds.xai_api_key)
+            await voice.connect()
+            tools = [notify_tool()] if self.settings.tools_webhook_url else []
+            row = self.store.get_call(tenant, call_id)
+            await voice.configure(
+                session_body(
+                    voice=creds.persona.voice,
+                    instructions=session_instructions(
+                        persona=creds.persona,
+                        briefing=row["briefing"] if row else "",
+                        questions=[],
+                        recordings=self.settings.recordings,
+                        inbound=True,
+                    ),
+                    tools=tools,
+                )
+            )
+            if control.stop.is_set():
+                self._cancel(call_id, control)
+                return
+            spoken = opening_line(self.settings.recordings, greeting)
+            await voice.force_message(spoken)
+            self.store.add_transcript(call_id, "assistant", spoken)
+            await self._relay(call_id, tenant, audio, sip, voice, control, max_seconds)
+            if control.reason == "failed":
+                raise RuntimeError("audio_ended")
+            await self._finish(call_id, tenant, voice, [], control.reason)
+        except Exception:
+            log.exception("call %s failed", call_id)
+            row = self.store.get_call(tenant, call_id)
+            if row and row["status"] in {"completed", "cancelled"}:
+                return
+            if control.reason == "completed":
+                control.reason = "failed"
+            self.store.update_call(
+                call_id,
+                status="failed",
+                error="call_failed",
+                end_reason=control.reason,
+                ended_at=utc_iso(),
+            )
+        finally:
+            try:
+                await sip.command("hangup")
+            except Exception:
+                pass
+            if voice is not None:
+                await voice.close()
+            if audio is not None:
+                await audio.stop()
+            async with self._lock:
+                self._global = max(0, self._global - 1)
+                self._tenants[tenant] = max(0, self._tenants.get(tenant, 1) - 1)
+            self.audios.pop(call_id, None)
+            self.controls.pop(call_id, None)
+            self.tasks.pop(call_id, None)
+            enforce_retention(self.store, self.settings.retention_days)
+
     async def _run(
         self,
         call_id: str,
@@ -441,6 +574,7 @@ class CallService:
                     "status": "completed",
                     "end_reason": reason,
                     "summary": summary,
+                    "direction": (row or {}).get("direction") or "outbound",
                     "destination": row["destination"] if row else "",
                 }
             )
@@ -465,10 +599,19 @@ class CallService:
             log.info("goodbye skipped for %s", call_id)
         return True
 
-    def _new_audio(self, call_id: str) -> MemoryAudio | PulseAudio:
+    def _new_audio(
+        self, call_id: str, devices: tuple[str, str] | None = None
+    ) -> MemoryAudio | PulseAudio:
         if self.settings.audio_mode == "memory":
             return MemoryAudio()
-        return PulseAudio(call_id)
+        if devices is None:
+            return PulseAudio(call_id)
+        return PulseAudio(
+            call_id,
+            play_name=devices[0],
+            mic_name=devices[1],
+            manage_sinks=False,
+        )
 
     async def _open_sip(
         self, creds: Credentials, play: str, mic: str
