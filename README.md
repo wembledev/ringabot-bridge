@@ -22,8 +22,8 @@ Small phone line for a Grok voice agent on a 1 GB VM. You bring your own carrier
   we have queued for the phone when xAI reports `speech_started`. A 10 s backstop, an idle timeout and a max
   call length end anything that lingers.
 
-One process, no database, no queue. No credentials ship in this repo; `.env.example` is
-an empty template.
+One process and one sqlite file for accounts and numbers. No queue. No credentials ship
+in this repo. `.env.example` lists names only.
 
 ```
 caller ──PSTN──> carrier DID ──SIP/TLS──> sip:+1NXXNXXXXXX@sip.voice.x.ai
@@ -38,10 +38,16 @@ caller ──PSTN──> carrier DID ──SIP/TLS──> sip:+1NXXNXXXXXX@sip.v
 ## Connect your Grok Bot (MCP)
 
 The server exposes a small MCP connector at `https://<PUBLIC_HOSTNAME>/mcp` (Streamable HTTP,
-stateless). Tools: `place_call(number, briefing)`, `list_calls(limit)`, `hang_up(call_id)`.
+stateless). Tools: `place_call(number, briefing)`, `list_calls(limit)`, `hang_up(call_id)`,
+`get_number(currency, area_code?)`.
 It uses the same guards as `POST /call` (allow list, no emergency numbers, AI greeting).
-Auth is a static `Authorization: Bearer <API_TOKEN>` (no OAuth); use 32+ random chars
-(`openssl rand -hex 32`). `list_calls` returns outbound calls only.
+`list_calls` returns outbound calls only.
+
+Auth is `Authorization: Bearer <token>` (no OAuth). `API_TOKEN` is the admin token for
+`/call`, `/calls`, and operator use of MCP. Each Grok Bot account uses its own token from
+`POST /signup`. The server stores only the SHA-256 hash. `place_call` and `list_calls`
+for an account token require a number in status `active`, and they see only that account's
+calls. The admin token keeps the previous behavior and does not need a paid number.
 
 ```bash
 # Grok CLI
@@ -51,6 +57,46 @@ grok mcp add --transport http ringabot https://<PUBLIC_HOSTNAME>/mcp \
 
 With the xAI API, pass the token as `authorization` on an `mcp` tool. Any MCP client that
 can send a bearer header works.
+
+## Buy a number
+
+`POST /signup` creates an account and returns `api_token` once. Put that token on the
+connector. The bot then calls `get_number` with `currency` `usd` or `cad` and an optional
+`area_code`. The tool returns a Stripe Checkout URL. The user opens it and approves one
+monthly subscription. Intended prices, once they exist in the dashboard, are $4 USD a
+month and $5 CAD a month.
+
+Checkout looks up the active monthly recurring price on `STRIPE_PRODUCT_ID` (default
+`prod_VSVWjrAodSEFv9`, the Wemble product on account `acct_1PJio5Ke24N6hhcu`) for the
+requested currency. A match is cached for 60 seconds. Set `STRIPE_PRICE_USD` or
+`STRIPE_PRICE_CAD` to skip the lookup for that currency. If no monthly price matches,
+`get_number` returns an error and does not charge.
+
+`POST /stripe/webhook` checks `Stripe-Signature` with `STRIPE_WEBHOOK_SECRET`.
+`checkout.session.completed` sets the number to `active`, keeps `e164` empty, stores the
+subscription id, and calls the provisioning hook. `customer.subscription.deleted` sets
+`cancelled`. A repeated event does not provision twice, and a completion after cancel
+does not turn the number back on.
+
+The hook in this repo only logs. It does not order a Voip.ms number or create a
+sub-account. That waits for Michael's OK. The real hook will create a Voip.ms
+sub-account, order a DID in the area code from Checkout metadata, route the DID to
+xAI SIP `<e164>@sip.voice.x.ai`, and write `e164` on the number row. Until then, an
+active number is the billing gate for `place_call`. Outbound audio still uses the
+host SIP account.
+
+The server refuses to start when `STRIPE_SECRET_KEY` starts with `sk_live_` unless
+`RINGABOT_LIVE_CHARGES=1`.
+
+```
+accounts(id, api_token_hash, email, stripe_customer_id, created_at)
+numbers(id, account_id, e164, status, stripe_subscription_id, currency, created_at)
+```
+
+`status` is `pending_payment`, `active`, or `cancelled`. `e164` stays null until the
+real provisioning hook runs. The sqlite file defaults to
+`/var/lib/ringabot/ringabot.sqlite` (`RINGABOT_DB`). The systemd unit's
+`StateDirectory=ringabot` is what makes that path writable under `ProtectSystem=strict`.
 
 ## Acceptable use
 
@@ -96,10 +142,13 @@ ID and fails immediately.
 
 ## Security
 
-- Every webhook is verified with Standard Webhooks v1 (HMAC-SHA256 over
+- Every xAI webhook is verified with Standard Webhooks v1 (HMAC-SHA256 over
   `id.timestamp.body`), a 5 minute timestamp window and a replay cache.
+- `POST /stripe/webhook` is verified with `Stripe-Signature` and `STRIPE_WEBHOOK_SECRET`.
+- Account tokens are stored as SHA-256 hashes. `POST /signup` is the only response that
+  contains a token.
 - Calls to any number other than `DID` are refused. `MAX_CONCURRENT_CALLS` caps load.
-- Admin routes need `API_TOKEN` and are not proxied by Caddy; call them over SSH.
+- Admin routes need `API_TOKEN` and are not proxied by Caddy. Call them over SSH.
 
 ## HTTP
 
@@ -107,9 +156,14 @@ ID and fails immediately.
 | --- | --- | --- |
 | `POST /xai/webhook` | xAI signature | Incoming-call events (public via Caddy) |
 | `GET /healthz` | none | Liveness and active call count (public via Caddy) |
-| `POST /call` | bearer | `{"number","briefing"}`: place one outbound call (same persona as inbound plus the briefing) |
-| `GET /calls` | bearer | Recent calls with transcripts |
-| `POST /calls/{id}/hangup` | bearer | End a call |
+| `POST /call` | admin bearer | `{"number","briefing"}`: place one outbound call (same persona as inbound plus the briefing) |
+| `GET /calls` | admin bearer | Recent calls with transcripts |
+| `POST /calls/{id}/hangup` | admin bearer | End a call |
+| `POST /mcp` | admin or account bearer | MCP tools, public via Caddy |
+| `POST /signup` | none | Create an account and return its bearer token once |
+| `POST /stripe/webhook` | Stripe signature | Activate or cancel a number |
+| `GET /billing/success` | none | Page Stripe sends the user to after Checkout |
+| `GET /billing/cancel` | none | Page Stripe sends the user to if they back out |
 
 ## Develop
 

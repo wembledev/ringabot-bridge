@@ -8,31 +8,62 @@ import logging
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
+from ringabot.billing import (
+    Billing,
+    BillingError,
+    LoggingProvisioner,
+    apply_stripe_event,
+    parse_stripe_event,
+)
 from ringabot.calls import CallManager
-from ringabot.config import Settings
+from ringabot.config import Settings, guard_live_charges
 from ringabot.mcp import make_endpoint
 from ringabot.signature import SignatureError, Verifier
+from ringabot.store import Admin, Store
 
 log = logging.getLogger("ringabot.app")
 MAX_BODY = 64 * 1024
 
 
-def _bearer_ok(request: Request, token: str) -> bool:
-    if not token:
-        return False
+def _bearer_token(request: Request) -> str | None:
     scheme, _, got = request.headers.get("authorization", "").partition(" ")
     if scheme.lower() != "bearer":
+        return None
+    got = got.strip()
+    return got or None
+
+
+def _bearer_ok(request: Request, token: str) -> bool:
+    got = _bearer_token(request)
+    if not token or got is None:
         return False
-    return hmac.compare_digest(got.strip().encode(), token.encode())
+    return hmac.compare_digest(got.encode(), token.encode())
 
 
-def create_app(settings: Settings | None = None, manager: CallManager | None = None) -> Starlette:
+def create_app(
+    settings: Settings | None = None,
+    manager: CallManager | None = None,
+    store: Store | None = None,
+    provisioner=None,
+) -> Starlette:
     settings = settings or Settings.from_env()
+    guard_live_charges(settings.stripe_secret_key, settings.live_charges)
     manager = manager or CallManager(settings)
+    store = store or Store(settings.db_path)
+    provisioner = provisioner or LoggingProvisioner()
+    billing = Billing(settings, store, provisioner)
     verifier = Verifier(settings.webhook_secret)
+
+    def identify(request: Request):
+        token = _bearer_token(request)
+        if token is None:
+            return None
+        if settings.api_token and hmac.compare_digest(token.encode(), settings.api_token.encode()):
+            return Admin()
+        return store.account_by_token(token)
 
     async def health(_request: Request) -> JSONResponse:
         return JSONResponse({"ok": True})
@@ -91,6 +122,36 @@ def create_app(settings: Settings | None = None, manager: CallManager | None = N
         manager.spawn(call.hangup("api"))
         return JSONResponse({"ok": True}, status_code=202)
 
+    async def signup(_request: Request) -> JSONResponse:
+        _account, token = store.create_account()
+        return JSONResponse({"account_id": _account.id, "api_token": token}, status_code=201)
+
+    async def stripe_webhook(request: Request) -> JSONResponse:
+        body = await request.body()
+        if len(body) > MAX_BODY:
+            return JSONResponse({"error": "too large"}, status_code=413)
+        try:
+            event = parse_stripe_event(
+                body,
+                request.headers.get("stripe-signature", ""),
+                settings.stripe_webhook_secret,
+            )
+            result = apply_stripe_event(store, provisioner, event)
+        except BillingError as exc:
+            log.warning("stripe webhook rejected: %s", exc)
+            text = str(exc)
+            status = 400 if ("signature" in text or text == "bad json") else 500
+            return JSONResponse({"error": text}, status_code=status)
+        return JSONResponse({"ok": True, "result": result})
+
+    def billing_success(_request: Request) -> PlainTextResponse:
+        return PlainTextResponse(
+            "Payment received. The number activates when Stripe confirms it.\n"
+        )
+
+    def billing_cancel(_request: Request) -> PlainTextResponse:
+        return PlainTextResponse("Checkout cancelled. No charge.\n")
+
     return Starlette(
         routes=[
             Route("/healthz", health),
@@ -98,10 +159,10 @@ def create_app(settings: Settings | None = None, manager: CallManager | None = N
             Route("/call", place_call, methods=["POST"]),
             Route("/calls", list_calls),
             Route("/calls/{call_id}/hangup", hangup, methods=["POST"]),
-            Route(
-                "/mcp",
-                make_endpoint(manager, lambda r: _bearer_ok(r, settings.api_token)),
-                methods=["POST"],
-            ),
+            Route("/signup", signup, methods=["POST"]),
+            Route("/stripe/webhook", stripe_webhook, methods=["POST"]),
+            Route("/billing/success", billing_success),
+            Route("/billing/cancel", billing_cancel),
+            Route("/mcp", make_endpoint(manager, identify, store, billing), methods=["POST"]),
         ]
     )

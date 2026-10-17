@@ -15,6 +15,16 @@ def test_set_value_replaces_and_keeps_0600(tmp_path):
     assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
 
 
-def test_caddy_exposes_only_webhook_and_health():
+def test_caddy_exposes_only_public_routes():
     caddy = (ROOT / "deploy/Caddyfile").read_text()
-    assert "/xai/webhook /healthz" in caddy and "/calls" not in caddy.split("@app")[1]
+    public = caddy.split("@app")[1]
+    assert "/xai/webhook /healthz" in caddy
+    for path in ("/mcp", "/signup", "/stripe/webhook", "/billing/success", "/billing/cancel"):
+        assert path in public
+    assert "/calls" not in public
+
+
+def test_service_can_write_its_database():
+    unit = (ROOT / "deploy/ringabot.service").read_text()
+    assert "StateDirectory=ringabot" in unit
+    assert "ProtectSystem=strict" in unit

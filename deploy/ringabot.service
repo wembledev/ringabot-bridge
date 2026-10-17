@@ -11,6 +11,7 @@ SupplementaryGroups=audio
 EnvironmentFile=/etc/ringabot/ringabot.env
 WorkingDirectory=/opt/ringabot
 RuntimeDirectory=ringabot
+StateDirectory=ringabot
 ExecStartPre=-+/sbin/modprobe snd-aloop
 ExecStart=/opt/ringabot/.venv/bin/ringabot serve
 Restart=on-failure

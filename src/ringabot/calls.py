@@ -542,7 +542,9 @@ class CallManager:
         self._start(InboundCall(self, call_id, record))
         return True, "accepted"
 
-    def place(self, number: str, briefing: str = "") -> tuple[str | None, str]:
+    def place(
+        self, number: str, briefing: str = "", account_id: str | None = None
+    ) -> tuple[str | None, str]:
         s = self.settings
         if not s.outbound_ready:
             return None, "outbound not configured"
@@ -556,6 +558,8 @@ class CallManager:
             return None, "busy"
         call_id = "out_" + uuid.uuid4().hex[:16]
         record = self._record(call_id, "outbound", e164(s.did), target)
+        if account_id:
+            record["account_id"] = account_id
         self._start(OutboundCall(self, call_id, record, target, briefing[:2000]))
         log.info("call %s outbound dialing", call_id)
         return call_id, "dialing"
