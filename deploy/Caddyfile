@@ -1,6 +1,6 @@
 # Automatic TLS. Public: the xAI webhook, the health check and the MCP connector
 # (/mcp, bearer API_TOKEN). Admin routes (/call, /calls) stay on loopback: use them over SSH.
-# Example PUBLIC_HOSTNAME: 203-0-113-7.sslip.io
+# Example PUBLIC_HOSTNAME: phone.example.com
 {$PUBLIC_HOSTNAME} {
 	@app path /xai/webhook /healthz /mcp
 	handle @app {
