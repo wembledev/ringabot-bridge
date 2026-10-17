@@ -169,8 +169,10 @@ def test_inbound_and_outbound_share_persona(settings):
     assert "Be brief and polite." in inbound["instructions"]
     assert "Ask about lunch" in outbound["instructions"]
     assert "audio" in outbound and "audio" not in inbound
-    text = opening_event(settings)["item"]["content"][0]["text"]
-    assert text.startswith(DISCLOSURE)
+    opening = opening_event(settings, "Ask about lunch")
+    assert opening["type"] == "response.create"  # normal, interruptible turn
+    assert DISCLOSURE in opening["response"]["instructions"]
+    assert "Ask about lunch" in opening["response"]["instructions"]
 
 
 class FakeAudio:

@@ -80,17 +80,14 @@ def session_config(settings, briefing: str = "", inbound: bool = False) -> dict:
     return {"type": "session.update", "session": session}
 
 
-def opening_event(settings) -> dict:
-    """Spoken first on every call: the AI disclosure, then the optional greeting."""
-    text = f"{DISCLOSURE} {settings.greeting}".strip()
+def opening_event(settings, briefing: str = "", inbound: bool = False) -> dict:
+    """First turn on every call: a normal response, so xAI's turn detection can interrupt
+    it like any other. Per-response instructions replace the session ones, so repeat them."""
+    line = f"{DISCLOSURE} {settings.greeting}".strip()
+    instructions = instructions_for(settings, briefing, inbound)
     return {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "force_message",
-            "role": "assistant",
-            "interruptible": False,
-            "content": [{"type": "output_text", "text": text}],
-        },
+        "type": "response.create",
+        "response": {"instructions": f'{instructions}\n\nStart the call now by saying: "{line}"'},
     }
 
 
@@ -289,7 +286,7 @@ class InboundCall(Call):
             async with websockets.connect(url, additional_headers=headers, open_timeout=10) as ws:
                 self.ws = ws
                 await self.send(session_config(s, inbound=True))
-                await self.send(opening_event(s))
+                await self.send(opening_event(s, inbound=True))
                 self.record["status"] = "in_progress"
                 dog = self.manager.spawn(self.watchdog())
                 try:
@@ -375,7 +372,7 @@ class OutboundCall(Call):
                     return
                 self.record["status"] = "in_progress"
                 self.started = self.last_activity = time.monotonic()
-                await self.send(opening_event(s))
+                await self.send(opening_event(s, self.briefing))
                 await self._relay(ws)
         except Exception as exc:  # noqa: BLE001
             self.record["error"] = self.record.get("error") or type(exc).__name__
