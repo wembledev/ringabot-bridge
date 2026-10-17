@@ -1,164 +1,77 @@
-"""Per-call audio paths.
-
-Production uses a PulseAudio null-sink pair at 8 kHz so the bridge only
-moves telephone audio. Tests and machines without a sound device use the
-in-process memory path. No extra media server.
-"""
+"""8 kHz S16 mono duplex over one snd-aloop substream (baresip <-> this process)."""
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import shutil
-from dataclasses import dataclass
-
-log = logging.getLogger("ringabot.audio")
 
 SAMPLE_RATE = 8000
+_used: set[int] = set()
 
 
 class AudioUnavailable(RuntimeError):
     pass
 
 
-@dataclass
-class PulseSinks:
-    play: str
-    mic: str
-    modules: list[str]
-
-
-def sink_names(call_id: str) -> tuple[str, str]:
-    safe = "".join(ch for ch in call_id if ch.isalnum())[:12]
-    return f"rb{safe}play", f"rb{safe}mic"
-
-
-def pulse_commands(play: str, mic: str) -> list[list[str]]:
-    return [
-        [
-            "pactl",
-            "load-module",
-            "module-null-sink",
-            f"sink_name={play}",
-            f"sink_properties=device.description={play}",
-        ],
-        [
-            "pactl",
-            "load-module",
-            "module-null-sink",
-            f"sink_name={mic}",
-            f"sink_properties=device.description={mic}",
-        ],
-    ]
-
-
-class MemoryAudio:
-    """Loopback used when AUDIO_MODE=memory. Remote audio is pushed by the caller."""
-
+class AlsaLoop:
     def __init__(self) -> None:
-        self._incoming: asyncio.Queue[bytes | None] = asyncio.Queue()
-        self.played = bytearray()
-        self.started = False
+        for n in range(1, 8):
+            if n not in _used:
+                _used.add(n)
+                self.substream = n
+                break
+        else:
+            raise AudioUnavailable("alsa_substreams_full")
+        self.baresip_device = f"hw:Loopback,0,{self.substream}"
+        self._device = f"hw:Loopback,1,{self.substream}"
+        self._capture: asyncio.subprocess.Process | None = None
+        self._playback: asyncio.subprocess.Process | None = None
 
     async def start(self) -> None:
-        self.started = True
-
-    async def stop(self) -> None:
-        await self._incoming.put(None)
-
-    async def push_remote(self, pcm: bytes) -> None:
-        await self._incoming.put(pcm)
-
-    async def read_remote(self) -> bytes | None:
-        return await self._incoming.get()
-
-    async def write_remote(self, pcm: bytes) -> None:
-        if pcm:
-            self.played.extend(pcm)
-
-
-class PulseAudio:
-    def __init__(self, call_id: str) -> None:
-        self.call_id = call_id
-        self.play_name, self.mic_name = sink_names(call_id)
-        self._modules: list[str] = []
-        self._parec: asyncio.subprocess.Process | None = None
-        self._pacat: asyncio.subprocess.Process | None = None
-        self._stdout: asyncio.StreamReader | None = None
-
-    async def start(self) -> None:
-        if shutil.which("pactl") is None:
-            raise AudioUnavailable("pactl is not installed")
-        for command in pulse_commands(self.play_name, self.mic_name):
-            proc = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                raise AudioUnavailable(stderr.decode("utf-8", "replace")[:200] or "pactl failed")
-            module_id = stdout.decode().strip()
-            if module_id:
-                self._modules.append(module_id)
-        self._parec = await asyncio.create_subprocess_exec(
-            "parec",
-            "-d",
-            f"{self.play_name}.monitor",
-            "--format=s16le",
-            f"--rate={SAMPLE_RATE}",
-            "--channels=1",
-            "--latency-msec=20",
-            stdout=asyncio.subprocess.PIPE,
+        if shutil.which("arecord") is None or shutil.which("aplay") is None:
+            raise AudioUnavailable("alsa-utils is not installed")
+        self._capture = await asyncio.create_subprocess_exec(
+            "arecord", *self._args(), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-        )
-        self._stdout = self._parec.stdout
-        self._pacat = await asyncio.create_subprocess_exec(
-            "pacat",
-            "-d",
-            self.mic_name,
-            "--format=s16le",
-            f"--rate={SAMPLE_RATE}",
-            "--channels=1",
-            "--latency-msec=20",
-            stdin=asyncio.subprocess.PIPE,
+        )  # fmt: skip
+        await self._start_playback()
+
+    def _args(self) -> list[str]:
+        return ["-D", self._device, "-f", "S16_LE", "-r", str(SAMPLE_RATE), "-c", "1",
+                "-t", "raw", "--period-time=20000", "--buffer-time=80000"]  # fmt: skip
+
+    async def _start_playback(self) -> None:
+        self._playback = await asyncio.create_subprocess_exec(
+            "aplay", *self._args(), stdin=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
-        )
+        )  # fmt: skip
 
-    async def stop(self) -> None:
-        await _terminate(self._parec)
-        await _terminate(self._pacat)
-        for module_id in self._modules:
-            proc = await asyncio.create_subprocess_exec(
-                "pactl",
-                "unload-module",
-                module_id,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-        self._modules.clear()
+    async def flush(self) -> None:
+        """Drop queued speech (barge-in): restart aplay so its pipe buffer is discarded."""
+        old, self._playback = self._playback, None
+        if old is not None and old.returncode is None:
+            old.kill()
+            await old.wait()
+        await self._start_playback()
 
-    async def read_remote(self) -> bytes | None:
-        if self._stdout is None:
+    async def read(self) -> bytes | None:
+        if self._capture is None or self._capture.stdout is None:
             return None
-        chunk = await self._stdout.read(320)
-        if not chunk:
-            return None
-        return chunk
+        return await self._capture.stdout.read(320) or None
 
-    async def write_remote(self, pcm: bytes) -> None:
-        if self._pacat is None or self._pacat.stdin is None:
+    async def write(self, pcm: bytes) -> None:
+        if self._playback is None or self._playback.stdin is None:
             return
-        self._pacat.stdin.write(pcm)
-        await self._pacat.stdin.drain()
+        # No drain(): the websocket reader must never wait on playback, or speech_started
+        # (barge-in) is read late. flush() discards whatever is still buffered.
+        self._playback.stdin.write(pcm)
 
-
-async def _terminate(proc: asyncio.subprocess.Process | None) -> None:
-    if proc is None or proc.returncode is not None:
-        return
-    proc.terminate()
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=2)
-    except TimeoutError:
-        proc.kill()
+    async def stop(self) -> None:
+        for proc in (self._capture, self._playback):
+            if proc is not None and proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except TimeoutError:
+                    proc.kill()
+        _used.discard(self.substream)

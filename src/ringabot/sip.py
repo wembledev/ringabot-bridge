@@ -1,22 +1,25 @@
-"""baresip runtime.
+"""baresip for outbound calls: one process per call, controlled over ctrl_tcp.
 
-Each call gets its own config directory and, unless SIP_CTRL points at an
-existing control socket, its own baresip process. Outbound INVITEs use digest
-auth. v1 does not keep a long-lived registration for inbound calls.
+Ubuntu 24.04 ships baresip 1.0.0. Its ctrl_tcp speaks netstring JSON. The SIP URI
+user is the carrier sub-account; the DID is only the display name (Voip.ms returns
+403 when the URI user is the DID). Audio goes through an snd-aloop PCM.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import shutil
 import socket
 from dataclasses import dataclass
 from pathlib import Path
 
-log = logging.getLogger("ringabot.sip")
+MODULE_CANDIDATES = (
+    "/usr/lib/baresip/modules",
+    "/usr/lib/x86_64-linux-gnu/baresip/modules",
+    "/usr/local/lib/baresip/modules",
+)
 
 
 class SipError(RuntimeError):
@@ -29,58 +32,80 @@ def safe_token(value: str, field: str) -> str:
     return value
 
 
-def account_line(*, user: str, password: str, server: str, did: str, regint: int) -> str:
+def module_dir() -> str:
+    for candidate in MODULE_CANDIDATES:
+        if Path(candidate).is_dir():
+            return candidate
+    return MODULE_CANDIDATES[0]
+
+
+def account_line(*, user: str, password: str, server: str, did: str) -> str:
     user = safe_token(user, "sip_user")
-    password = safe_token(password, "sip_password")
-    server = safe_token(server, "sip_server")
-    identity = safe_token(did.lstrip("+"), "did") if did else user
+    display = f'"{safe_token(did, "did")}" ' if did else ""
     return (
-        f"<sip:{identity}@{server}>;auth_user={user};auth_pass={password};"
-        f"regint={regint};answermode=manual"
+        f"{display}<sip:{user}@{safe_token(server, 'sip_server')}>;auth_user={user};"
+        f"auth_pass={safe_token(password, 'sip_password')};regint=0;answermode=manual"
     )
 
 
-def write_config(
-    directory: Path,
-    *,
-    user: str,
-    password: str,
-    server: str,
-    did: str,
-    ctrl_port: int,
-    play_device: str,
-    mic_device: str,
-    regint: int,
-) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    os.chmod(directory, 0o700)
-    config = "\n".join(
+def config_text(ctrl_port: int, pcm: str) -> str:
+    return "\n".join(
         [
-            "sip_listen 127.0.0.1:0",
-            f"audio_player pulse,{play_device}",
-            f"audio_source pulse,{mic_device}.monitor",
+            "sip_listen 0.0.0.0:0",
+            f"module_path {module_dir()}",
+            f"audio_player alsa,{pcm}",
+            f"audio_source alsa,{pcm}",
             "audio_srate 8000",
             "audio_channels 1",
             "audio_buffer 20-160",
             f"ctrl_tcp_listen 127.0.0.1:{ctrl_port}",
-            "module stdio.so",
             "module g711.so",
-            "module pulse.so",
+            "module alsa.so",
             "module account.so",
             "module ctrl_tcp.so",
+            "module menu.so",
             "module uuid.so",
             "",
         ]
     )
-    _write_private(directory / "config", config)
-    _write_private(
-        directory / "accounts",
-        account_line(user=user, password=password, server=server, did=did, regint=regint) + "\n",
-    )
 
 
-def dial_uri(digits: str, server: str) -> str:
+def dial_uri(number: str, server: str) -> str:
+    digits = "".join(ch for ch in number if ch.isdigit())
     return f"sip:{safe_token(digits, 'number')}@{safe_token(server, 'sip_server')}"
+
+
+def encode_ctrl(command: str, params: str = "") -> bytes:
+    body = json.dumps({"command": command, "params": params}, separators=(",", ":")).encode()
+    return f"{len(body)}:".encode() + body + b","
+
+
+def drain_frames(buf: bytearray) -> list[bytes]:
+    """Pull complete netstrings (``len:json,``) out of buf; leave partial input."""
+    frames: list[bytes] = []
+    while buf:
+        if buf[0] in b" \t\r\n":
+            del buf[0]
+            continue
+        colon = buf.find(b":", 0, 10)
+        if colon < 0:
+            if len(buf) > 10:
+                raise ValueError("bad_frame")
+            break
+        length_text = bytes(buf[:colon])
+        if not length_text.isdigit():
+            raise ValueError("bad_frame")
+        length = int(length_text)
+        if length > 65536:
+            raise ValueError("frame_too_long")
+        end = colon + 1 + length
+        if len(buf) < end + 1:
+            break
+        if buf[end] != ord(","):
+            raise ValueError("bad_netstring")
+        frames.append(bytes(buf[colon + 1 : end]))
+        del buf[: end + 1]
+    return frames
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -89,83 +114,51 @@ def _write_private(path: Path, text: str) -> None:
         handle.write(text)
 
 
-def free_port() -> int:
+def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
 
 
 class SipClient:
-    """Line protocol: one JSON object or a plain command per line.
+    """ctrl_tcp client. Events land on ``events`` as dicts; EOF on disconnect."""
 
-    Plain commands (``dial``, ``hangup``, ``register``) are what baresip's
-    ctrl_tcp module accepts. The fake UA and baresip both emit JSON events
-    with a ``type`` field (CALL_ESTABLISHED, CALL_CLOSED, REGISTER_OK, ...).
-    """
-
-    def __init__(self, host: str, port: int) -> None:
-        self.host = host
+    def __init__(self, port: int) -> None:
         self.port = port
-        self.events: asyncio.Queue[dict] = asyncio.Queue(maxsize=32)
-        self._reader: asyncio.StreamReader | None = None
+        self.events: asyncio.Queue[dict] = asyncio.Queue(maxsize=64)
         self._writer: asyncio.StreamWriter | None = None
         self._task: asyncio.Task | None = None
 
     async def connect(self) -> None:
-        self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
-        self._task = asyncio.create_task(self._read())
+        reader, self._writer = await asyncio.open_connection("127.0.0.1", self.port)
+        self._task = asyncio.create_task(self._read(reader))
 
-    async def _read(self) -> None:
-        assert self._reader is not None
+    async def _read(self, reader: asyncio.StreamReader) -> None:
         buf = bytearray()
         try:
-            while True:
-                chunk = await self._reader.read(4096)
-                if not chunk:
-                    if buf:
-                        await self._emit_line(bytes(buf))
-                    await self.events.put({"type": "EOF"})
-                    return
+            while chunk := await reader.read(4096):
                 buf.extend(chunk)
-                if len(buf) > 65536 and b"\n" not in buf:
-                    await self.events.put({"type": "EOF"})
-                    return
-                while b"\n" in buf:
-                    line, _, rest = bytes(buf).partition(b"\n")
-                    buf = bytearray(rest)
-                    if len(line) > 8192:
-                        await self.events.put({"type": "EOF"})
-                        return
-                    await self._emit_line(line)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("sip read failed")
-            await self.events.put({"type": "EOF"})
-
-    async def _emit_line(self, line: bytes) -> None:
-        text = line.decode("utf-8", "replace").strip()
-        if not text:
-            return
-        if text.startswith("{"):
-            try:
-                await self.events.put(json.loads(text))
-                return
-            except json.JSONDecodeError:
-                pass
-        await self.events.put({"type": "RAW", "line": text})
+                for frame in drain_frames(buf):
+                    try:
+                        await self.events.put(json.loads(frame))
+                    except json.JSONDecodeError:
+                        continue
+        except (ValueError, OSError):
+            pass
+        await self.events.put({"type": "EOF"})
 
     async def command(self, line: str) -> None:
         if self._writer is None:
             raise SipError("sip_not_connected")
-        self._writer.write((line.strip() + "\n").encode())
+        command, _, params = line.strip().partition(" ")
+        self._writer.write(encode_ctrl(command, params))
         await self._writer.drain()
 
     async def wait_type(self, *types: str, timeout: float) -> dict:
         async with asyncio.timeout(timeout):
             while True:
                 event = await self.events.get()
-                if event.get("type") in types or event.get("type") in {"ERROR", "EOF"}:
+                if event.get("type") in (*types, "EOF"):
                     return event
 
     async def close(self) -> None:
@@ -173,14 +166,10 @@ class SipClient:
             self._task.cancel()
         if self._writer is not None:
             self._writer.close()
-            try:
-                await self._writer.wait_closed()
-            except Exception:
-                pass
 
 
 @dataclass
-class BaresipProcess:
+class Baresip:
     directory: Path
     port: int
     process: asyncio.subprocess.Process
@@ -195,58 +184,38 @@ class BaresipProcess:
         shutil.rmtree(self.directory, ignore_errors=True)
 
 
-async def start_baresip(
-    *,
-    work_root: Path,
-    user: str,
-    password: str,
-    server: str,
-    did: str,
-    play_device: str,
-    mic_device: str,
-    regint: int,
-) -> BaresipProcess:
+async def start_baresip(*, work_dir: Path, pcm: str, user: str, password: str, server: str,
+                        did: str) -> Baresip:  # fmt: skip
     binary = shutil.which("baresip")
     if binary is None:
         raise SipError("baresip_not_installed")
-    port = free_port()
-    directory = work_root / f"baresip-{port}"
-    write_config(
-        directory,
-        user=user,
-        password=password,
-        server=server,
-        did=did,
-        ctrl_port=port,
-        play_device=play_device,
-        mic_device=mic_device,
-        regint=regint,
+    port = _free_port()
+    directory = work_dir / f"baresip-{port}"
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    _write_private(directory / "config", config_text(port, pcm))
+    _write_private(
+        directory / "accounts",
+        account_line(user=user, password=password, server=server, did=did) + "\n",
     )
-    process: asyncio.subprocess.Process | None = None
-    try:
-        process = await asyncio.create_subprocess_exec(
-            binary,
-            "-f",
-            str(directory),
-            "-n",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        deadline = asyncio.get_running_loop().time() + 5
-        while asyncio.get_running_loop().time() < deadline:
-            if process.returncode is not None:
-                raise SipError("baresip_exited")
-            try:
-                _probe_reader, probe_writer = await asyncio.open_connection("127.0.0.1", port)
-            except (ConnectionRefusedError, OSError):
-                await asyncio.sleep(0.05)
-                continue
-            probe_writer.close()
-            await probe_writer.wait_closed()
-            return BaresipProcess(directory=directory, port=port, process=process)
-        raise SipError("baresip_ctrl_timeout")
-    except Exception:
-        if process is not None and process.returncode is None:
-            process.kill()
-        shutil.rmtree(directory, ignore_errors=True)
-        raise
+    # Output is discarded: the account file holds the SIP password.
+    process = await asyncio.create_subprocess_exec(
+        binary, "-f", str(directory),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )  # fmt: skip
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while loop.time() < deadline:
+        if process.returncode is not None:
+            break
+        try:
+            _r, w = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            await asyncio.sleep(0.05)
+            continue
+        w.close()
+        return Baresip(directory=directory, port=port, process=process)
+    if process.returncode is None:
+        process.kill()
+    shutil.rmtree(directory, ignore_errors=True)
+    raise SipError("baresip_start_failed")
