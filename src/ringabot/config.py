@@ -24,7 +24,6 @@ def _list(env: dict[str, str], name: str) -> list[str]:
 class Settings:
     xai_api_key: str = ""
     webhook_secret: str = ""
-    webhook_bearer: str = ""
     api_token: str = ""
     did: str = ""
     public_url: str = ""
@@ -38,16 +37,11 @@ class Settings:
     max_call_seconds: int = 600
     idle_seconds: int = 30
     max_concurrent_calls: int = 2
-    replay_window_seconds: int = 300
-    keep_calls: int = 20
     # Outbound (baresip dials through the carrier; audio relayed over snd-aloop).
     sip_server: str = ""
     sip_username: str = ""
     sip_password: str = ""
     allowed_destinations: list[str] = field(default_factory=list)
-    work_dir: str = "/run/ringabot"
-    api_base: str = "https://api.x.ai"
-    realtime_url: str = "wss://api.x.ai/v1/realtime"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -55,7 +49,6 @@ class Settings:
         return cls(
             xai_api_key=(env.get("XAI_API_KEY") or "").strip(),
             webhook_secret=(env.get("XAI_WEBHOOK_SECRET") or "").strip(),
-            webhook_bearer=(env.get("XAI_WEBHOOK_BEARER") or "").strip(),
             api_token=(env.get("API_TOKEN") or "").strip(),
             did=(env.get("DID") or "").strip(),
             public_url=(env.get("PUBLIC_URL") or "").strip().rstrip("/"),
@@ -69,15 +62,10 @@ class Settings:
             max_call_seconds=_int(env, "MAX_CALL_SECONDS", 600),
             idle_seconds=_int(env, "IDLE_TIMEOUT", 30),
             max_concurrent_calls=_int(env, "MAX_CONCURRENT_CALLS", 2),
-            replay_window_seconds=_int(env, "WEBHOOK_REPLAY_WINDOW_SECONDS", 300),
-            keep_calls=_int(env, "KEEP_CALLS", 20),
             sip_server=(env.get("SIP_SERVER") or "").strip(),
             sip_username=(env.get("SIP_USERNAME") or "").strip(),
             sip_password=(env.get("SIP_PASSWORD") or "").strip(),
             allowed_destinations=_list(env, "ALLOWED_DESTINATIONS"),
-            work_dir=(env.get("WORK_DIR") or "/run/ringabot").strip(),
-            api_base=(env.get("XAI_API_BASE") or "https://api.x.ai").rstrip("/"),
-            realtime_url=(env.get("XAI_REALTIME_URL") or "wss://api.x.ai/v1/realtime"),
         )
 
     @property

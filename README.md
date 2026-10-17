@@ -7,7 +7,7 @@ Small phone line for a Grok voice agent on a 1 GB VM. You bring your own carrier
   `realtime.call.incoming` webhook; we answer it in milliseconds, then join the call with
   `wss://api.x.ai/v1/realtime?call_id=...` in a background task. No audio touches this host.
 - **One persona:** the webhook server sets voice, instructions, opening line and tools for
-  every call (`session_config`, `opening_event`); outbound only adds a briefing. Every call
+  every call (`session_config`); outbound only adds a briefing. Every call
   opens with "Hello! I am an AI assistant, not a human. I cannot contact emergency
   services." as a normal response that xAI can interrupt like any other turn. Inbound
   answers first; outbound waits for the callee's hello (greets anyway after 4 s).
@@ -39,7 +39,7 @@ caller ──PSTN──> carrier DID ──SIP/TLS──> sip:+1NXXNXXXXXX@sip.v
 Not a dialer for telemarketing or robocalls. Outbound calls only go to numbers matching
 `ALLOWED_DESTINATIONS`, never to emergency numbers, and open with a line saying the caller
 is an AI assistant. Nothing is recorded; transcripts live only in memory (last
-`KEEP_CALLS` calls) behind the admin token.
+20 calls) behind the admin token.
 
 ## Install (Ubuntu 24.04)
 
@@ -80,7 +80,6 @@ ID and fails immediately.
 
 - Every webhook is verified with Standard Webhooks v1 (HMAC-SHA256 over
   `id.timestamp.body`), a 5 minute timestamp window and a replay cache.
-- Optional `XAI_WEBHOOK_BEARER` is registered with xAI and must match too.
 - Calls to any number other than `DID` are refused. `MAX_CONCURRENT_CALLS` caps load.
 - Admin routes need `API_TOKEN` and are not proxied by Caddy; call them over SSH.
 

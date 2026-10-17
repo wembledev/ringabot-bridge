@@ -5,8 +5,8 @@ exchange JSON events. Outbound: baresip dials through the carrier and we relay 8
 between snd-aloop and the xAI realtime websocket.
 
 Hang-up follows the same pattern as the voice agent we already run: the agent says
-goodbye itself, then calls end_call; we reply "hanging up", let that last response
-finish playing, wait a short tail, and send exactly one hang-up. A backstop timer,
+goodbye itself, then calls end_call; we reply {"ok": true} (nothing more is said), let
+the goodbye finish playing, wait a short tail, and send exactly one hang-up. A backstop timer,
 an idle timeout and a max call length make sure no call stays open.
 """
 
@@ -46,6 +46,9 @@ GREET_AFTER_SECONDS = 4.0
 
 DISCLOSURE = "I am an AI assistant, not a human. I cannot contact emergency services."
 SAMPLE_FORMAT = {"type": "audio/pcm", "rate": SAMPLE_RATE}
+REALTIME_URL = "wss://api.x.ai/v1/realtime"
+WORK_DIR = Path("/run/ringabot")
+KEEP_CALLS = 20
 
 
 def instructions_for(settings, briefing: str = "", inbound: bool = False) -> str:
@@ -59,7 +62,7 @@ def instructions_for(settings, briefing: str = "", inbound: bool = False) -> str
         "emergency number themselves. Do not claim the call is being recorded.\n"
         f"Additional persona notes:\n{settings.instructions}\n"
         f"Purpose of this call:\n{purpose}\n"
-        f"{'' if inbound else _wait_line(settings)}"
+        f"{_first_line(settings, inbound)}\n"
         "Keep turns short. When the task is done, say goodbye, then use the end_call tool. "
         "Never use end_call just because the other person said goodbye or hang up."
     )
@@ -70,11 +73,11 @@ def opening_line(settings) -> str:
     return f"Hello! {DISCLOSURE} {settings.greeting}".strip()
 
 
-def _wait_line(settings) -> str:
+def _first_line(settings, inbound: bool) -> str:
     line = opening_line(settings)
-    return (
-        f'You placed this call. Let them speak first, then begin your first reply with: "{line}"\n'
-    )
+    if inbound:
+        return f'Start the call by saying: "{line}"'
+    return f'You placed this call. Let them speak first, then begin your first reply with: "{line}"'
 
 
 def session_config(settings, briefing: str = "", inbound: bool = False) -> dict:
@@ -94,15 +97,9 @@ def session_config(settings, briefing: str = "", inbound: bool = False) -> dict:
     return {"type": "session.update", "session": session}
 
 
-def opening_event(settings, briefing: str = "", inbound: bool = False) -> dict:
-    """First turn on every call: a normal response, so xAI's turn detection can interrupt
-    it like any other. Per-response instructions replace the session ones, so repeat them."""
-    line = opening_line(settings)
-    instructions = instructions_for(settings, briefing, inbound)
-    return {
-        "type": "response.create",
-        "response": {"instructions": f'{instructions}\n\nStart the call now by saying: "{line}"'},
-    }
+# First turn: a plain response; the session instructions say what to open with, and
+# xAI's turn detection can interrupt it like any other response.
+OPENING_EVENT = {"type": "response.create"}
 
 
 def _header(sip_headers: list, name: str) -> str:
@@ -110,6 +107,12 @@ def _header(sip_headers: list, name: str) -> str:
         if isinstance(h, dict) and str(h.get("name", "")).lower() == name.lower():
             return str(h.get("value", ""))
     return ""
+
+
+def _sip_user(header: str) -> str:
+    """E.164 of the user part of a To/From value such as "<sip:+17785550100@host>"."""
+    user = header.split("sip:", 1)[-1].split("@", 1)[0].split(";", 1)[0]
+    return e164(user)
 
 
 def e164(number: str) -> str:
@@ -131,10 +134,7 @@ class Call:
         self.record = record
         self.ws = None
         self.armed = False
-        self._need_new_response = False  # idle/max goodbye: wait for the response we ask for
-        self._goodbye_started = False
         self._tail_spawned = False
-        self._response_started = time.monotonic()
         self.play_until = 0.0  # monotonic time the agent's queued speech should end
         self._items: dict[str, dict] = {}
         self._hung_up = False
@@ -150,6 +150,9 @@ class Call:
         log.info("call %s hanging up (%s)", self.call_id, reason)
         with contextlib.suppress(Exception):
             await self._hangup_leg()
+        if self.ws is not None:  # ends the event loop even if the hang-up leg failed
+            with contextlib.suppress(Exception):
+                await self.ws.close()
 
     async def _hangup_leg(self) -> None:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -174,7 +177,6 @@ class Call:
     async def say_goodbye(self, reason: str) -> None:
         if self.armed:
             return
-        self._need_new_response = True
         self.arm(reason)
         await self.send(
             {
@@ -231,19 +233,11 @@ class Call:
             self._transcript("caller", event)
         elif etype == "response.output_audio_transcript.done":
             self._transcript("agent", event)
-            # Speech runs about 14 characters a second; xAI may still be playing it.
-            spoken = len(event.get("transcript") or "") / 14.0
-            self.play_until = max(self.play_until, self._response_started + spoken)
         elif etype == "response.function_call_arguments.done":
             await self._tool(event)
-        elif etype == "response.created":
-            self._response_started = now
-            if self.armed:
-                self._goodbye_started = True
         elif etype == "response.done" and self.armed and not self._tail_spawned:
-            if not self._need_new_response or self._goodbye_started:
-                self._tail_spawned = True
-                self.manager.spawn(self._after_tail())
+            self._tail_spawned = True
+            self.manager.spawn(self._after_tail())
         elif etype == "error":
             log.warning("call %s realtime error: %s", self.call_id, str(event.get("error"))[:200])
 
@@ -255,7 +249,7 @@ class Call:
         """end_call gets a bare {"ok": true} and no new response, so nothing more is said;
         we hang up once the goodbye that came before it has played."""
         name = event.get("name", "")
-        self.record["tools"].append(name)
+        self.record["tools"] = [*self.record["tools"], name][-20:]
         output = {"ok": True} if name == "end_call" else {"error": "unknown tool"}
         await self.send(
             {
@@ -289,18 +283,32 @@ class InboundCall(Call):
 
     tail_seconds = 1.5
 
+    def __init__(self, manager, call_id, record):
+        super().__init__(manager, call_id, record)
+        self._response_started = time.monotonic()
+
     async def _hangup_leg(self) -> None:
         await self.manager.xai.hangup(self.call_id)
 
+    async def on_event(self, event: dict) -> None:
+        etype = event.get("type")
+        if etype == "response.created":
+            self._response_started = time.monotonic()
+        elif etype == "response.output_audio_transcript.done":
+            # Speech runs about 14 characters a second; xAI may still be playing it.
+            spoken = len(event.get("transcript") or "") / 14.0
+            self.play_until = max(self.play_until, self._response_started + spoken)
+        await super().on_event(event)
+
     async def run(self) -> None:
         s = self.settings
-        url = f"{s.realtime_url}?call_id={self.call_id}"
+        url = f"{REALTIME_URL}?call_id={self.call_id}"
         headers = {"Authorization": f"Bearer {s.xai_api_key}"}
         try:
             async with websockets.connect(url, additional_headers=headers, open_timeout=10) as ws:
                 self.ws = ws
                 await self.send(session_config(s, inbound=True))
-                await self.send(opening_event(s, inbound=True))
+                await self.send(OPENING_EVENT)
                 self.record["status"] = "in_progress"
                 dog = self.manager.spawn(self.watchdog())
                 try:
@@ -315,6 +323,7 @@ class InboundCall(Call):
         except Exception as exc:  # noqa: BLE001
             self.record["error"] = type(exc).__name__
             log.warning("call %s failed: %s", self.call_id, type(exc).__name__)
+            await self.hangup("error")  # xAI already answered; don't leave dead air
         finally:
             self.finish()
 
@@ -353,7 +362,7 @@ class OutboundCall(Call):
         await asyncio.sleep(GREET_AFTER_SECONDS)
         if not self._heard and not self._hung_up:
             self._heard = True
-            await self.send(opening_event(self.settings, self.briefing))
+            await self.send(OPENING_EVENT)
 
     async def on_interrupt(self) -> None:
         """Caller started talking: xAI already cancels its response; we only drop the
@@ -371,7 +380,7 @@ class OutboundCall(Call):
             self.audio = AlsaLoop()
             await self.audio.start()
             baresip = await start_baresip(
-                work_dir=Path(s.work_dir),
+                work_dir=WORK_DIR,
                 pcm=self.audio.baresip_device,
                 user=s.sip_username,
                 password=s.sip_password,
@@ -382,13 +391,16 @@ class OutboundCall(Call):
             await self.sip.connect()
             headers = {"Authorization": f"Bearer {s.xai_api_key}"}
             async with websockets.connect(
-                s.realtime_url, additional_headers=headers, open_timeout=10, max_size=2**20
+                REALTIME_URL, additional_headers=headers, open_timeout=10, max_size=2**20
             ) as ws:
                 self.ws = ws
                 await self.send(session_config(s, self.briefing))
                 self.record["status"] = "dialing"
+                # Throw away audio captured while ringing so ringback never reaches xAI.
+                ringing = self.manager.spawn(self._discard_audio())
                 await self.sip.command(f"dial {dial_uri(self.number, s.sip_server)}")
                 ev = await self.sip.wait_type("CALL_ESTABLISHED", "CALL_CLOSED", timeout=60)
+                ringing.cancel()
                 if ev.get("type") != "CALL_ESTABLISHED":
                     self.record["error"] = "not_answered"
                     self.record["end_reason"] = "not_answered"
@@ -411,6 +423,10 @@ class OutboundCall(Call):
             if self.audio is not None:
                 await self.audio.stop()
             self.finish()
+
+    async def _discard_audio(self) -> None:
+        while await self.audio.read() is not None:
+            pass
 
     async def _relay(self, ws) -> None:
         async def mic() -> None:
@@ -443,9 +459,9 @@ class OutboundCall(Call):
 class CallManager:
     def __init__(self, settings, xai: XaiClient | None = None):
         self.settings = settings
-        self.xai = xai or XaiClient(settings.xai_api_key, settings.api_base)
+        self.xai = xai or XaiClient(settings.xai_api_key)
         self.active: dict[str, Call] = {}
-        self.recent: deque[dict] = deque(maxlen=settings.keep_calls)
+        self.recent: deque[dict] = deque(maxlen=KEEP_CALLS)
         self._tasks: set[asyncio.Task] = set()
 
     def spawn(self, coro) -> asyncio.Task:
@@ -488,7 +504,7 @@ class CallManager:
             return True, "duplicate"
         sip = data.get("sip_headers") or []
         to = _header(sip, "To")
-        if self.settings.did and e164(self.settings.did)[1:] not in to.replace("+", ""):
+        if self.settings.did and _sip_user(to) != e164(self.settings.did):
             return False, "not our number"
         if len(self.active) >= self.settings.max_concurrent_calls:
             self.spawn(self.xai.hangup(call_id))
@@ -503,7 +519,7 @@ class CallManager:
         if not s.outbound_ready:
             return None, "outbound not configured"
         digits = "".join(ch for ch in number if ch.isdigit())
-        if digits in EMERGENCY or len(digits) < 10:
+        if digits in EMERGENCY or not 10 <= len(digits) <= 15:
             return None, "number not allowed"
         target = e164(number)
         if not any(target.startswith(p) for p in s.allowed_destinations):

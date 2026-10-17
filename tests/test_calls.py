@@ -92,16 +92,14 @@ async def test_hangup_waits_for_goodbye_playback(settings):
     assert manager.xai.hangups == ["c1"]
 
 
-async def test_idle_goodbye_waits_for_its_own_response(settings):
+async def test_idle_says_goodbye_then_hangs_up_once(settings):
     manager, call = _inbound(settings)
     await call.say_goodbye("idle")
-    await call.on_event({"type": "response.done"})  # an older response finishing
-    await _drain(manager)
-    assert manager.xai.hangups == []
-    await call.on_event({"type": "response.created"})
+    assert call.ws.sent[-1]["type"] == "response.create"
+    await call.on_event({"type": "response.done"})
     await call.on_event({"type": "response.done"})
     await _drain(manager)
-    assert manager.xai.hangups == ["c1"]
+    assert manager.xai.hangups == ["c1"] and call.record["end_reason"] == "idle"
 
 
 async def test_caller_transcript_deduped_by_item(settings):
@@ -159,7 +157,7 @@ async def test_outbound_end_call_hangs_up_sip_leg(settings):
 
 
 def test_inbound_and_outbound_share_persona(settings):
-    from ringabot.calls import DISCLOSURE, opening_event, session_config
+    from ringabot.calls import DISCLOSURE, OPENING_EVENT, session_config
 
     inbound = session_config(settings, inbound=True)["session"]
     outbound = session_config(settings, "Ask about lunch")["session"]
@@ -169,10 +167,8 @@ def test_inbound_and_outbound_share_persona(settings):
     assert "Be brief and polite." in inbound["instructions"]
     assert "Ask about lunch" in outbound["instructions"]
     assert "audio" in outbound and "audio" not in inbound
-    opening = opening_event(settings, "Ask about lunch")
-    assert opening["type"] == "response.create"  # normal, interruptible turn
-    assert DISCLOSURE in opening["response"]["instructions"]
-    assert "Ask about lunch" in opening["response"]["instructions"]
+    assert OPENING_EVENT == {"type": "response.create"}  # normal, interruptible turn
+    assert DISCLOSURE in inbound["instructions"] and DISCLOSURE in outbound["instructions"]
 
 
 class FakeAudio:
@@ -229,8 +225,23 @@ def test_outbound_persona_says_wait_for_hello(settings):
 
 
 def test_every_call_opens_with_hello_then_disclosure(settings):
-    from ringabot.calls import DISCLOSURE, opening_event, opening_line
+    from ringabot.calls import DISCLOSURE, opening_line, session_config
 
     assert opening_line(settings).startswith(f"Hello! {DISCLOSURE}")
-    inbound = opening_event(settings, inbound=True)["response"]["instructions"]
-    assert opening_line(settings) in inbound
+    for inbound in (True, False):
+        instructions = session_config(settings, inbound=inbound)["session"]["instructions"]
+        assert opening_line(settings) in instructions
+
+
+def test_inbound_only_accepts_exact_did(settings):
+    from ringabot.calls import _sip_user
+
+    assert _sip_user("<sip:+17785550100@sip.voice.x.ai>;tag=1") == "+17785550100"
+    manager = CallManager(settings, xai=FakeXai())
+    to = [{"name": "To", "value": "<sip:+117785550100999@x>"}]
+    assert manager.accept({"call_id": "c9", "sip_headers": to}) == (False, "not our number")
+
+
+def test_place_rejects_overlong_numbers(settings):
+    manager = CallManager(settings, xai=FakeXai())
+    assert manager.place("+1604555011199999")[0] is None

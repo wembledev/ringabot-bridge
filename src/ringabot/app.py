@@ -29,17 +29,15 @@ def _bearer_ok(request: Request, token: str) -> bool:
 def create_app(settings: Settings | None = None, manager: CallManager | None = None) -> Starlette:
     settings = settings or Settings.from_env()
     manager = manager or CallManager(settings)
-    verifier = Verifier(settings.webhook_secret, settings.replay_window_seconds)
+    verifier = Verifier(settings.webhook_secret)
 
     async def health(_request: Request) -> JSONResponse:
-        return JSONResponse({"ok": True, "active_calls": len(manager.active)})
+        return JSONResponse({"ok": True})
 
     async def xai_webhook(request: Request) -> JSONResponse:
         body = await request.body()
         if len(body) > MAX_BODY:
             return JSONResponse({"error": "too large"}, status_code=413)
-        if settings.webhook_bearer and not _bearer_ok(request, settings.webhook_bearer):
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
         try:
             verifier.verify(request.headers, body)
         except SignatureError as exc:

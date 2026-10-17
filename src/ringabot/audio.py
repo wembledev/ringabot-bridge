@@ -62,8 +62,9 @@ class AlsaLoop:
     async def write(self, pcm: bytes) -> None:
         if self._playback is None or self._playback.stdin is None:
             return
+        # No drain(): the websocket reader must never wait on playback, or speech_started
+        # (barge-in) is read late. flush() discards whatever is still buffered.
         self._playback.stdin.write(pcm)
-        await self._playback.stdin.drain()
 
     async def stop(self) -> None:
         for proc in (self._capture, self._playback):

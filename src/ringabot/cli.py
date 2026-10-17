@@ -7,17 +7,11 @@ import asyncio
 import logging
 import sys
 
+from ringabot.calls import e164
 from ringabot.config import Settings
 from ringabot.envfile import set_value
 from ringabot.signature import SignatureError, Verifier
 from ringabot.xai import XaiClient
-
-
-def _e164(n: str) -> str:
-    digits = "".join(ch for ch in n if ch.isdigit())
-    if len(digits) == 10:
-        digits = "1" + digits
-    return "+" + digits
 
 
 async def _doctor(s: Settings) -> int:
@@ -48,9 +42,9 @@ async def _doctor(s: Settings) -> int:
         line(bool(s.allowed_destinations), "ALLOWED_DESTINATIONS set")
     if s.xai_api_key:
         try:
-            numbers = await XaiClient(s.xai_api_key, s.api_base).list_numbers()
+            numbers = await XaiClient(s.xai_api_key).list_numbers()
             line(True, "xAI key accepted")
-            mine = [n for n in numbers if n.get("phone_number") == _e164(s.did)] if s.did else []
+            mine = [n for n in numbers if n.get("phone_number") == e164(s.did)] if s.did else []
             line(bool(mine), "DID registered with xAI as Direct SIP")
             if mine:
                 line(bool(mine[0].get("webhook_id")), "DID dispatches to a webhook")
@@ -64,8 +58,8 @@ async def _register(s: Settings, env_file: str, name: str) -> int:
     if not (s.xai_api_key and s.did and s.webhook_url.startswith("https://")):
         print("need XAI_API_KEY, DID and an https PUBLIC_URL", file=sys.stderr)
         return 2
-    client = XaiClient(s.xai_api_key, s.api_base)
-    number = _e164(s.did)
+    client = XaiClient(s.xai_api_key)
+    number = e164(s.did)
     existing = [n for n in await client.list_numbers() if n.get("phone_number") == number]
     if existing:
         print(
@@ -78,8 +72,6 @@ async def _register(s: Settings, env_file: str, name: str) -> int:
         "phone_number": number,
         "webhook": {"name": name, "url": s.webhook_url},
     }
-    if s.webhook_bearer:
-        body["webhook"]["auth_token"] = s.webhook_bearer
     if s.sip_allowed_cidrs:
         body["sip_auth"] = {"allowed_addresses": s.sip_allowed_cidrs}
     resp = await client.create_number(body)

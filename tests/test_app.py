@@ -80,13 +80,6 @@ def test_busy_limit(settings):
     assert _post(client, _incoming(call_id="cx"), msg_id="mx").json()["detail"] == "busy"
 
 
-def test_bearer_required_when_configured(settings):
-    client, _ = _client(replace(settings, webhook_bearer="bearer-placeholder"))
-    assert _post(client, _incoming()).status_code == 401
-    extra = {"authorization": "Bearer bearer-placeholder"}
-    assert _post(client, _incoming(), msg_id="m2", extra=extra).status_code == 200
-
-
 def test_admin_routes_need_token(settings):
     client, _ = _client(settings)
     assert client.get("/calls").status_code == 401
