@@ -1,118 +1,142 @@
 # ringabot-bridge
 
-Small phone line for a Grok voice agent on a 1 GB VM. You bring your own carrier number
-(for example Voip.ms) and your own xAI key.
+Ringabot is a lightweight listener for [xAI](https://x.ai) voice calls on a Voip.ms SIP line. Inbound calls arrive as a signed webhook. Outbound calls dial out through baresip. An MCP connector on `/mcp` exposes `place_call`, `list_calls`, and `hang_up`, authenticated with `Authorization: Bearer <API_TOKEN>`.
 
-- **Inbound:** the carrier routes the DID straight to xAI Direct SIP. xAI POSTs a signed
-  `realtime.call.incoming` webhook; we answer it in milliseconds, then join the call with
-  `wss://api.x.ai/v1/realtime?call_id=...` in a background task. No audio touches this host.
-- **One persona:** the webhook server sets voice, instructions, opening line and tools for
-  every call (`session_config`); outbound only adds a briefing. Every call
-  opens with a short greeting (default "Hi, this is Ringabot, an AI assistant.") as a normal
-  response that xAI can interrupt like any other turn; the full AI and emergency rules stay
-  in the instructions. Inbound
-  answers first; outbound waits for the callee's hello (greets anyway after 4 s).
-- **Outbound:** `POST /call` starts one baresip process that dials through the carrier
-  sub-account; 8 kHz PCM is relayed between snd-aloop and the xAI realtime websocket.
-- **Hang-up:** the agent says goodbye, then calls `end_call`. We return a bare
-  `{"ok": true}` without asking for a new response (so nothing else is spoken), wait until
-  the goodbye has played plus a short tail, and send exactly one hang-up (xAI call
-  control for inbound, baresip for outbound).
-- **Turn-taking:** xAI's server VAD owns interruptions. On outbound we only drop the speech
-  we have queued for the phone when xAI reports `speech_started`. A 10 s backstop, an idle timeout and a max
-  call length end anything that lingers.
+One process, no database. Audio for inbound calls stays on xAI. Outbound audio is relayed on this host between baresip and the xAI realtime websocket. Nothing is recorded.
 
-One process, no database, no queue. No credentials ship in this repo; `.env.example` is
-an empty template.
+Built by [Wemble Development Corporation](https://wemble.com), BC, Canada.
 
-```
-caller ──PSTN──> carrier DID ──SIP/TLS──> sip:+1NXXNXXXXXX@sip.voice.x.ai
-                                               │ signed webhook
-                                               ▼
-                         Caddy (TLS) ──> ringabot :8787 (loopback)
-                                               │ websocket by call_id (JSON events only)
-                                               ▼
-                                         xAI realtime session
-```
+## Do it yourself
 
-## Connect your Grok Bot (MCP)
+Prefer not to run a server? A hosted number is $4 USD or $5 CAD a month at [ringabot.com](https://ringabot.com).
 
-The server exposes a small MCP connector at `https://<PUBLIC_HOSTNAME>/mcp` (Streamable HTTP,
-stateless). Tools: `place_call(number, briefing)`, `list_calls(limit)`, `hang_up(call_id)`.
-It uses the same guards as `POST /call` (allow list, no emergency numbers, AI greeting).
-Auth is a static `Authorization: Bearer <API_TOKEN>` (no OAuth); use 32+ random chars
-(`openssl rand -hex 32`). `list_calls` returns outbound calls only.
+1. **Voip.ms number.** Create your own Voip.ms account and order a phone number. In the DID routing settings, send it to the SIP URI `<e164>@sip.voice.x.ai` (your number in E.164, such as `+15555550100@sip.voice.x.ai`). The sub-account used for outbound calls needs a caller ID and device type "IP phone / softphone".
+
+2. **xAI voice agent.** Create your own xAI API key. After step 3 is serving HTTPS, register that number so xAI sends call events to this bridge:
+
+   ```bash
+   sudo bash -c 'set -a; . /etc/ringabot/ringabot.env; set +a; \
+     /opt/ringabot/.venv/bin/ringabot register-number --name my-line'
+   ```
+
+   That command creates the Direct SIP number and webhook, and writes the signing secret into the env file. Then point Voip.ms at `sip:<e164>@sip.voice.x.ai` if you have not already. Set `SIP_ALLOWED_CIDRS` to your carrier's signaling range before you register, so xAI only accepts INVITEs from that range.
+
+3. **Small VPS.** A 1 GB machine is enough (about $5 a month). These commands assume Ubuntu 24.04. Replace `phone.example.com` with your own hostname, and fill `/etc/ringabot/ringabot.env` from `.env.example` (mode `0600`, never commit it).
+
+   ```bash
+   sudo apt update
+   sudo apt install -y baresip alsa-utils caddy
+   curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin sh
+   echo snd-aloop | sudo tee /etc/modules-load.d/snd-aloop.conf
+   sudo modprobe snd-aloop
+
+   sudo useradd --system --home /opt/ringabot --shell /usr/sbin/nologin ringabot
+   sudo git clone https://github.com/wembledev/ringabot-bridge /opt/ringabot
+   sudo bash -c 'cd /opt/ringabot && uv sync --frozen --no-dev'
+
+   sudo install -d -m 0750 -o root -g ringabot /etc/ringabot
+   sudo install -m 0640 -o root -g ringabot /opt/ringabot/.env.example /etc/ringabot/ringabot.env
+   sudo chmod 0600 /etc/ringabot/ringabot.env
+   sudo chown ringabot:ringabot /etc/ringabot/ringabot.env
+   sudoedit /etc/ringabot/ringabot.env
+
+   sudo cp /opt/ringabot/deploy/Caddyfile /etc/caddy/Caddyfile
+   sudo systemctl edit caddy
+   ```
+
+   In the Caddy drop-in:
+
+   ```ini
+   [Service]
+   Environment=PUBLIC_HOSTNAME=phone.example.com
+   ```
+
+   Caddy terminates HTTPS and proxies only `/xai/webhook`, `/healthz`, and `/mcp`. Admin routes stay on loopback. Open `443/tcp` and `80/tcp`. For outbound audio, allow UDP from your carrier's media range to ports 1024–65535.
+
+   ```bash
+   sudo cp /opt/ringabot/deploy/ringabot.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now caddy ringabot
+   ```
+
+   Generate the bearer token with `openssl rand -hex 32` and put it in `API_TOKEN`.
+
+4. **Grok Bot.** Add the MCP connector. The URL is `https://phone.example.com/mcp`. Send `Authorization: Bearer <API_TOKEN>`.
+
+   ```bash
+   grok mcp add --transport http ringabot https://phone.example.com/mcp \
+     --header "Authorization: Bearer ${RINGABOT_API_TOKEN}"
+   ```
+
+   Tools: `place_call(number, briefing)`, `list_calls(limit)` (outbound calls only), `hang_up(call_id)`. Any MCP client that can send a bearer header can use the same URL.
+
+5. **Check the box.**
+
+   ```bash
+   sudo -u ringabot bash -c 'set -a; . /etc/ringabot/ringabot.env; set +a; \
+     /opt/ringabot/.venv/bin/ringabot doctor'
+   ```
+
+   Green means every line starts with `ok` and the last line is `doctor: clean`: the xAI key is set and accepted, the webhook secret is well formed, `API_TOKEN` is 32 characters or more, `DID` and `PUBLIC_URL` are set, the process is bound to loopback, baresip and snd-aloop are present, `ALLOWED_DESTINATIONS` is set, and the DID is registered with xAI.
+
+6. **First test call.** Put your own mobile number in `ALLOWED_DESTINATIONS`, restart the service, and place one call. It opens by saying it is an AI assistant.
+
+   ```bash
+   sudo systemctl restart ringabot
+   curl -sS -X POST http://127.0.0.1:8787/call \
+     -H "Authorization: Bearer $API_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"number":"+15555550100","briefing":"This is a test. Say hello and hang up."}'
+   ```
+
+   Or ask Grok Bot to call `place_call` with that number and a short briefing.
+
+Outbound calls only go to numbers matching `ALLOWED_DESTINATIONS`, never to emergency numbers.
+
+## Environment
+
+Copy `.env.example` to `/etc/ringabot/ringabot.env`. Leave a value blank to keep the default.
+
+| Variable | Purpose |
+| --- | --- |
+| `XAI_API_KEY` | Your xAI API key |
+| `XAI_WEBHOOK_SECRET` | Webhook signing secret (`whsec_...`). `register-number` writes this |
+| `API_TOKEN` | Bearer token for `/mcp` and the admin routes. 32+ characters |
+| `DID` | Your carrier number, E.164 or 10 digits |
+| `PUBLIC_URL` | Public `https://` origin Caddy serves |
+| `SIP_ALLOWED_CIDRS` | Carrier signaling ranges allowed to INVITE xAI |
+| `HOST`, `PORT` | Listener. Default `127.0.0.1:8787` |
+| `PERSONA_NAME`, `VOICE`, `INSTRUCTIONS`, `GREETING` | Persona. Defaults: Ringabot, voice `aurora`, brief and polite, greeting that says it is an AI |
+| `MAX_CALL_SECONDS`, `IDLE_TIMEOUT`, `MAX_CONCURRENT_CALLS` | Defaults: 600, 30, 2 |
+| `SIP_SERVER`, `SIP_USERNAME`, `SIP_PASSWORD` | Carrier sub-account for outbound dialing |
+| `ALLOWED_DESTINATIONS` | Comma-separated E.164 prefixes you may call |
+
+## Run and test
+
+Locally:
 
 ```bash
-# Grok CLI
-grok mcp add --transport http ringabot https://<PUBLIC_HOSTNAME>/mcp \
-  --header "Authorization: Bearer ${RINGABOT_API_TOKEN}"
+uv sync --all-groups
+uv run ringabot serve
 ```
 
-With the xAI API, pass the token as `authorization` on an `mcp` tool. Any MCP client that
-can send a bearer header works.
-
-## Acceptable use
-
-Not a dialer for telemarketing or robocalls. Outbound calls only go to numbers matching
-`ALLOWED_DESTINATIONS`, never to emergency numbers, and open with a line saying the caller
-is an AI assistant. Nothing is recorded; transcripts live only in memory (last
-20 calls) behind the admin token.
-
-## Install (Ubuntu 24.04)
+`ringabot doctor` checks configuration. `ringabot register-number` registers the DID.
 
 ```bash
-sudo useradd --system --home /opt/ringabot ringabot
-sudo git clone https://github.com/wembledev/ringabot-bridge /opt/ringabot
-cd /opt/ringabot && sudo uv sync --frozen --no-dev
-sudo install -d -m 0750 -o root -g ringabot /etc/ringabot
-sudo install -m 0600 -o ringabot .env.example /etc/ringabot/ringabot.env   # then fill it
-sudo apt install caddy && sudo cp deploy/Caddyfile /etc/caddy/Caddyfile   # set PUBLIC_HOSTNAME
-sudo apt install baresip alsa-utils && echo snd-aloop | sudo tee /etc/modules-load.d/snd-aloop.conf
-sudo cp deploy/ringabot.service /etc/systemd/system/
+uv run ruff check .
+uv run ruff format --check .
+uv run pytest
 ```
-
-Then register your number with xAI. This creates the Direct SIP number and its webhook,
-and writes the one-time signing secret into the env file without printing it:
-
-```bash
-sudo bash -c 'set -a; . /etc/ringabot/ringabot.env; set +a; \
-  /opt/ringabot/.venv/bin/ringabot register-number --name my-line'
-sudo systemctl enable --now ringabot
-sudo -u ringabot bash -c 'set -a; . /etc/ringabot/ringabot.env; set +a; \
-  /opt/ringabot/.venv/bin/ringabot doctor'
-```
-
-Finally point the carrier at xAI. In Voip.ms: DID → Routing → SIP URI
-`+1NXXNXXXXXX@sip.voice.x.ai`. Set `SIP_ALLOWED_CIDRS` to your carrier's signaling range
-before registering so xAI only accepts INVITEs from it.
-
-Open `443/tcp` and `80/tcp` (ACME) for the webhook. For outbound calls also allow UDP
-from your carrier's media range (Voip.ms: its POP subnet) to ports 1024-65535.
-
-For outbound on Voip.ms, the sub-account needs a caller ID number set and device type
-"IP phone / softphone"; otherwise the call goes out with the sub-account name as caller
-ID and fails immediately.
-
-## Security
-
-- Every webhook is verified with Standard Webhooks v1 (HMAC-SHA256 over
-  `id.timestamp.body`), a 5 minute timestamp window and a replay cache.
-- Calls to any number other than `DID` are refused. `MAX_CONCURRENT_CALLS` caps load.
-- Admin routes need `API_TOKEN` and are not proxied by Caddy; call them over SSH.
 
 ## HTTP
 
 | Route | Auth | What |
 | --- | --- | --- |
 | `POST /xai/webhook` | xAI signature | Incoming-call events (public via Caddy) |
-| `GET /healthz` | none | Liveness and active call count (public via Caddy) |
-| `POST /call` | bearer | `{"number","briefing"}`: place one outbound call (same persona as inbound plus the briefing) |
-| `GET /calls` | bearer | Recent calls with transcripts |
-| `POST /calls/{id}/hangup` | bearer | End a call |
+| `GET /healthz` | none | Liveness (public via Caddy) |
+| `POST /mcp` | bearer | MCP connector (public via Caddy) |
+| `POST /call` | bearer | Place one outbound call (loopback only) |
+| `GET /calls` | bearer | Recent calls and transcripts (loopback only) |
+| `POST /calls/{id}/hangup` | bearer | End a call (loopback only) |
 
-## Develop
-
-```bash
-uv sync --all-groups && uv run ruff check . && uv run pytest
-```
+Webhooks are checked with Standard Webhooks v1 (HMAC-SHA256 over `id.timestamp.body`), a 5 minute window, and a replay cache. Calls to any number other than `DID` are refused.

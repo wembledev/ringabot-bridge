@@ -4,10 +4,10 @@ Inbound: xAI answers the SIP call itself; we join by call_id over a websocket an
 exchange JSON events. Outbound: baresip dials through the carrier and we relay 8 kHz PCM
 between snd-aloop and the xAI realtime websocket.
 
-Hang-up follows the same pattern as the voice agent we already run: the agent says
-goodbye itself, then calls end_call; we reply {"ok": true} (nothing more is said), let
-the goodbye finish playing, wait a short tail, and send exactly one hang-up. A backstop timer,
-an idle timeout and a max call length make sure no call stays open.
+Hang-up: the agent says goodbye itself, then calls end_call. We reply {"ok": true}
+(nothing more is said), let the goodbye finish playing, wait a short tail, and send
+exactly one hang-up. A backstop timer, an idle timeout and a max call length make sure
+no call stays open.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ KEEP_CALLS = 20
 
 
 def instructions_for(settings, briefing: str = "", inbound: bool = False) -> str:
-    """The one persona for every call (text of the Oct 16 outbound test bridge)."""
+    """The one persona for every call. Outbound adds the briefing; inbound does not."""
     situation = "This is an incoming call to the user's number. " if inbound else ""
     purpose = briefing or "Answer the caller and help with what they need."
     return (
