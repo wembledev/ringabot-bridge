@@ -42,6 +42,9 @@ END_CALL_TOOL = {
 EMERGENCY = {"911", "112", "999", "000", "988", "110", "119"}
 BACKSTOP_SECONDS = 10.0
 GREET_AFTER_SECONDS = 4.0
+FRAME_BYTES = 320  # 20 ms of 8 kHz s16 mono
+PREROLL_BYTES = 2400  # 150 ms cushion written up front so the phone side never underruns
+BYTES_PER_SECOND = 16000
 
 
 DISCLOSURE = "I am an AI assistant, not a human. I cannot contact emergency services."
@@ -339,6 +342,8 @@ class OutboundCall(Call):
         self.audio: AlsaLoop | None = None
         self._muted = False
         self._heard = False
+        self._out = bytearray()  # xAI audio waiting to be played at real time
+        self._out_ready = asyncio.Event()
 
     async def _hangup_leg(self) -> None:
         if self.sip is not None:
@@ -353,10 +358,31 @@ class OutboundCall(Call):
         elif etype == "response.output_audio.delta" and self.audio is not None and not self._muted:
             with contextlib.suppress(Exception):
                 pcm = base64.b64decode(event.get("delta") or "")
-                # 8 kHz s16 mono = 16000 bytes a second of queued speech.
-                self.play_until = max(self.play_until, time.monotonic()) + len(pcm) / 16000
-                await self.audio.write(pcm)
+                queued = len(pcm) / BYTES_PER_SECOND
+                self.play_until = max(self.play_until, time.monotonic()) + queued
+                self._out += pcm
+                self._out_ready.set()
         await super().on_event(event)
+
+    async def _speaker(self) -> None:
+        """Play queued xAI audio at real time: xAI sends it in fast bursts, and writing a
+        burst straight into the loopback makes the start of a response choppy."""
+        while True:
+            await self._out_ready.wait()
+            deadline = time.monotonic() + PREROLL_BYTES / BYTES_PER_SECOND
+            while len(self._out) < PREROLL_BYTES and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)  # let a little audio build up first
+            chunk = bytes(self._out[:PREROLL_BYTES])
+            del self._out[:PREROLL_BYTES]
+            next_at = time.monotonic()
+            while chunk:
+                with contextlib.suppress(Exception):
+                    await self.audio.write(chunk)
+                next_at += FRAME_BYTES / BYTES_PER_SECOND
+                await asyncio.sleep(max(0.0, next_at - time.monotonic()))
+                chunk = bytes(self._out[:FRAME_BYTES])
+                del self._out[:FRAME_BYTES]
+            self._out_ready.clear()
 
     async def _greet_if_silent(self) -> None:
         await asyncio.sleep(GREET_AFTER_SECONDS)
@@ -369,6 +395,7 @@ class OutboundCall(Call):
         speech we have queued for the phone and ignore late chunks of that response."""
         self._muted = True
         self.play_until = 0.0
+        self._out.clear()
         if self.audio is not None:
             with contextlib.suppress(Exception):
                 await self.audio.flush()
@@ -448,7 +475,8 @@ class OutboundCall(Call):
                 self.record["end_reason"] = self.record.get("end_reason") or "remote_hangup"
                 self._hung_up = True  # the far end already hung up; no BYE needed
 
-        tasks = [asyncio.create_task(c()) for c in (mic, voice, remote, self.watchdog)]
+        jobs = (mic, voice, remote, self.watchdog, self._speaker)
+        tasks = [asyncio.create_task(c()) for c in jobs]
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:

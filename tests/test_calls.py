@@ -194,11 +194,27 @@ async def test_outbound_barge_in_drops_queued_speech(settings):
     await call.on_event(chunk)
     await call.on_event({"type": "input_audio_buffer.speech_started"})
     await call.on_event(chunk)  # late chunk of the cancelled response
-    assert call.audio.written == [b"ab"] and call.audio.flushes == 1
+    assert call._out == b"" and call.audio.flushes == 1
     assert call.ws.sent == []  # no response.cancel: xAI's server VAD handles that
     await call.on_event({"type": "response.created"})
     await call.on_event(chunk)
-    assert len(call.audio.written) == 2
+    assert call._out == b"ab"
+
+
+async def test_outbound_speaker_paces_after_preroll(settings):
+    manager = CallManager(settings, xai=FakeXai())
+    call = OutboundCall(manager, "out_1", _record(), "+16045550111", "")
+    call.audio = FakeAudio()
+    call._out += bytes(calls.PREROLL_BYTES + 3 * calls.FRAME_BYTES)  # 210 ms of audio
+    call._out_ready.set()
+    task = asyncio.create_task(call._speaker())
+    await asyncio.sleep(0.02)
+    sizes = [len(c) for c in call.audio.written]
+    assert sizes[0] == calls.PREROLL_BYTES and len(sizes) < 4  # pre-roll, then real time
+    await asyncio.sleep(0.12)
+    assert [len(c) for c in call.audio.written] == [calls.PREROLL_BYTES] + [calls.FRAME_BYTES] * 3
+    assert not call._out_ready.is_set()
+    task.cancel()
 
 
 async def test_outbound_waits_for_hello_then_greets_as_backstop(settings, monkeypatch):
