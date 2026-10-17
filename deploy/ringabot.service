@@ -1,5 +1,5 @@
 [Unit]
-Description=Ringabot bridge
+Description=Ringabot xAI SIP webhook listener
 After=network-online.target
 Wants=network-online.target
 
@@ -7,22 +7,21 @@ Wants=network-online.target
 Type=simple
 User=ringabot
 Group=ringabot
-SupplementaryGroups=audio
 EnvironmentFile=/etc/ringabot/ringabot.env
-Environment=XDG_RUNTIME_DIR=/run/ringabot
-RuntimeDirectory=ringabot
 WorkingDirectory=/opt/ringabot
-ExecStartPre=-+/sbin/modprobe snd-aloop
 ExecStart=/opt/ringabot/.venv/bin/ringabot serve
 Restart=on-failure
 RestartSec=2
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ringabot
-MemoryMax=800M
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=200M
 LimitNOFILE=4096
 SystemCallArchitectures=native
 

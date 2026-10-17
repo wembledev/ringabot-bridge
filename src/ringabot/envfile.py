@@ -1,15 +1,25 @@
-"""Quote values for a systemd EnvironmentFile."""
+"""Update one KEY=value in an env file in place, keeping mode 0600."""
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 
-def quote_env(value: str) -> str:
-    """Return a double-quoted EnvironmentFile value.
 
-    systemd expands unquoted ``$`` and treats an unquoted space as the end of
-    the value, so ``PERSONA_NAME=Example Assistant`` would load as ``Example``.
-    Quotes and newlines are rejected so the file stays one assignment per line.
-    """
-    if any(ch in value for ch in '\r\n"'):
-        raise ValueError("unsafe_env_value")
-    return f'"{value}"'
+def set_value(path: str, key: str, value: str) -> None:
+    p = Path(path)
+    lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+    out, done = [], False
+    for line in lines:
+        if line.split("=", 1)[0].strip() == key:
+            out.append(f"{key}={value}")
+            done = True
+        else:
+            out.append(line)
+    if not done:
+        out.append(f"{key}={value}")
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+    os.replace(tmp, p)

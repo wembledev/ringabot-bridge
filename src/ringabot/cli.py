@@ -1,83 +1,113 @@
-"""`ringabot serve` and `ringabot doctor`."""
+"""ringabot serve | doctor | register-number"""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import logging
 import sys
-from pathlib import Path
 
-import uvicorn
+from ringabot.config import Settings
+from ringabot.envfile import set_value
+from ringabot.signature import SignatureError, Verifier
+from ringabot.xai import XaiClient
 
-from ringabot.config import load_env_file, load_settings
-from ringabot.doctor import failed, format_report, run_doctor
-from ringabot.store import Store
 
-HELP = """ringabot-bridge
+def _e164(n: str) -> str:
+    digits = "".join(ch for ch in n if ch.isdigit())
+    if len(digits) == 10:
+        digits = "1" + digits
+    return "+" + digits
 
-  ringabot serve          start the HTTP and MCP server on 127.0.0.1
-  ringabot doctor         check the token, SIP REGISTER, xAI key, TLS, and inbound
-  ringabot doctor --offline
-                          check local files only
 
-Configuration is environment variables. See .env.example.
-"""
+async def _doctor(s: Settings) -> int:
+    problems = 0
+
+    def line(ok: bool, msg: str) -> None:
+        nonlocal problems
+        problems += 0 if ok else 1
+        print(("ok   " if ok else "FAIL ") + msg)
+
+    line(bool(s.xai_api_key), "XAI_API_KEY set")
+    try:
+        Verifier(s.webhook_secret)
+        line(True, "XAI_WEBHOOK_SECRET set and well formed")
+    except SignatureError as exc:
+        line(False, f"XAI_WEBHOOK_SECRET: {exc}")
+    line(bool(s.api_token), "API_TOKEN set (admin endpoints)")
+    line(bool(s.did), "DID set")
+    line(s.public_url.startswith("https://"), "PUBLIC_URL is https")
+    line(s.host in ("127.0.0.1", "::1", "localhost"), f"listener bound to loopback ({s.host})")
+    try:
+        s.extra_tools()
+        line(True, "TOOLS_FILE parses (or unset)")
+    except Exception as exc:  # noqa: BLE001
+        line(False, f"TOOLS_FILE: {type(exc).__name__}")
+    if s.xai_api_key:
+        try:
+            numbers = await XaiClient(s.xai_api_key, s.api_base).list_numbers()
+            line(True, "xAI key accepted")
+            mine = [n for n in numbers if n.get("phone_number") == _e164(s.did)] if s.did else []
+            line(bool(mine), "DID registered with xAI as Direct SIP")
+            if mine:
+                line(bool(mine[0].get("webhook_id")), "DID dispatches to a webhook")
+        except Exception as exc:  # noqa: BLE001
+            line(False, f"xAI API check: {type(exc).__name__}")
+    print("doctor: clean" if problems == 0 else f"doctor: {problems} problem(s)")
+    return 0 if problems == 0 else 1
+
+
+async def _register(s: Settings, env_file: str, name: str) -> int:
+    if not (s.xai_api_key and s.did and s.webhook_url.startswith("https://")):
+        print("need XAI_API_KEY, DID and an https PUBLIC_URL", file=sys.stderr)
+        return 2
+    client = XaiClient(s.xai_api_key, s.api_base)
+    number = _e164(s.did)
+    existing = [n for n in await client.list_numbers() if n.get("phone_number") == number]
+    if existing:
+        print(
+            f"{number} is already registered ({existing[0].get('phone_number_id')}); not changing"
+        )
+        return 1
+    body: dict = {
+        "origin": "byo_trunk",
+        "name": name,
+        "phone_number": number,
+        "webhook": {"name": name, "url": s.webhook_url},
+    }
+    if s.webhook_bearer:
+        body["webhook"]["auth_token"] = s.webhook_bearer
+    if s.sip_allowed_cidrs:
+        body["sip_auth"] = {"allowed_addresses": s.sip_allowed_cidrs}
+    resp = await client.create_number(body)
+    secret = (resp.get("webhook") or {}).get("dispatch_signing_secret", "")
+    if secret:
+        set_value(env_file, "XAI_WEBHOOK_SECRET", secret)
+    pn = resp.get("phone_number") or {}
+    print(f"registered {number} as {pn.get('phone_number_id')} -> {s.webhook_url}")
+    print("signing secret saved to env file" if secret else "WARNING: no signing secret returned")
+    print(f"route your carrier to sip:{number}@{pn.get('sip_host', 'sip.voice.x.ai')}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
-    _load_env()
-    if not args or args[0] in {"-h", "--help", "help"}:
-        print(HELP)
-        return 0
-    if args[0] == "doctor":
-        return _doctor("--offline" in args)
-    if args[0] == "serve":
-        return _serve()
-    print(HELP, file=sys.stderr)
-    return 2
+    parser = argparse.ArgumentParser(prog="ringabot")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("serve")
+    sub.add_parser("doctor")
+    reg = sub.add_parser("register-number", help="register DID with xAI Direct SIP + webhook")
+    reg.add_argument("--env-file", default="/etc/ringabot/ringabot.env")
+    reg.add_argument("--name", default="ringabot")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    s = Settings.from_env()
+    if args.cmd == "doctor":
+        return asyncio.run(_doctor(s))
+    if args.cmd == "register-number":
+        return asyncio.run(_register(s, args.env_file, args.name))
+    import uvicorn
 
+    from ringabot.app import create_app
 
-def _load_env() -> None:
-    import os
-
-    named = os.environ.get("RINGABOT_ENV_FILE", "").strip()
-    candidates = [Path(named)] if named else [Path("/etc/ringabot/ringabot.env"), Path(".env")]
-    for path in candidates:
-        if path.is_file():
-            load_env_file(path)
-            os.environ.setdefault("RINGABOT_ENV_FILE", str(path))
-            return
-
-
-def _doctor(offline: bool) -> int:
-    try:
-        settings = load_settings()
-    except SystemExit as exc:
-        print(f"fail     config           {exc}")
-        return 1
-    store = Store(settings.data_dir / "ringabot.db", settings.master_key)
-    try:
-        checks = asyncio.run(run_doctor(settings, store, offline=offline))
-    finally:
-        store.close()
-    print(format_report(checks))
-    return 1 if failed(checks) else 0
-
-
-def _serve() -> int:
-    try:
-        settings = load_settings()
-    except SystemExit as exc:
-        print(exc, file=sys.stderr)
-        return 1
-    if len(settings.api_token) < 16:
-        print("API_TOKEN must be at least 16 characters", file=sys.stderr)
-        return 1
-    uvicorn.run(
-        "ringabot.asgi:build",
-        host=settings.host,
-        port=settings.port,
-        factory=True,
-        log_level=settings.log_level.lower(),
-    )
+    uvicorn.run(create_app(s), host=s.host, port=s.port, access_log=False, log_level="info")
     return 0

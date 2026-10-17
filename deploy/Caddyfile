@@ -1,5 +1,11 @@
-# Automatic TLS. The API stays on loopback.
-# Caddy substitutes {$PUBLIC_HOSTNAME}. Example: phone.example.com
-{$PUBLIC_HOSTNAME:localhost} {
-	reverse_proxy 127.0.0.1:8787
+# Automatic TLS. Only the webhook, health and admin routes are proxied.
+# Example PUBLIC_HOSTNAME: 203-0-113-7.sslip.io
+{$PUBLIC_HOSTNAME} {
+	@app path /xai/webhook /healthz /calls /calls/*
+	handle @app {
+		reverse_proxy 127.0.0.1:8787
+	}
+	handle {
+		respond 404
+	}
 }
