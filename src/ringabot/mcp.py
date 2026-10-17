@@ -13,7 +13,7 @@ from starlette.responses import JSONResponse, Response
 
 from ringabot import __version__
 
-VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MAX_BODY = 64 * 1024
 
 TOOLS = [
@@ -38,7 +38,7 @@ TOOLS = [
     },
     {
         "name": "list_calls",
-        "description": "Recent calls (newest first) with status and transcript.",
+        "description": "Recent outbound calls (newest first) with status and transcript.",
         "inputSchema": {
             "type": "object",
             "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 20}},
@@ -80,7 +80,13 @@ def _call_tool(manager, name: str, args: dict) -> dict:
             limit = max(1, min(20, int(args.get("limit", 10))))
         except (TypeError, ValueError):
             limit = 10
-        return _text({"calls": list(manager.recent)[:limit]})
+        keep = ("call_id", "to", "status", "started_at", "ended_at", "end_reason", "transcript")
+        calls = [
+            {k: r.get(k) for k in keep if k in r}
+            for r in manager.recent
+            if r.get("direction") == "outbound"
+        ]
+        return _text({"calls": calls[:limit]})
     if name == "hang_up":
         call = manager.active.get(str(args.get("call_id", "")))
         if call is None:
@@ -98,8 +104,6 @@ def make_endpoint(manager, authorized):
                 status_code=401,
                 headers={"www-authenticate": "Bearer"},
             )
-        if request.method != "POST":
-            return Response(status_code=405, headers={"allow": "POST"})
         body = await request.body()
         if len(body) > MAX_BODY:
             return _err(None, -32600, "request too large", 413)
@@ -110,9 +114,11 @@ def make_endpoint(manager, authorized):
         if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
             return _err(None, -32600, "invalid request", 400)
         method, rid = msg.get("method"), msg.get("id")
-        if "id" not in msg:  # notification or response: nothing to return
+        if "id" not in msg or "method" not in msg:  # notification or response
             return Response(status_code=202)
         params = msg.get("params") or {}
+        if not isinstance(params, dict):
+            return _err(rid, -32602, "params must be an object")
         if method == "initialize":
             asked = params.get("protocolVersion")
             return _ok(

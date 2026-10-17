@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 from starlette.testclient import TestClient
 
@@ -38,20 +39,29 @@ def test_mcp_needs_token(settings):
     assert _rpc(client, "tools/list", headers={}).status_code == 401
     bad = {"authorization": "Bearer nope"}
     assert _rpc(client, "tools/list", headers=bad).status_code == 401
-    assert client.get("/mcp").status_code == 401
     assert client.get("/mcp", headers=AUTH).status_code == 405
+    lower = {"authorization": "bearer admin-placeholder"}
+    assert _rpc(client, "ping", headers=lower).status_code == 200
+
+
+def test_empty_token_refuses_everything(settings):
+    client, _ = _client(replace(settings, api_token=""))
+    assert _rpc(client, "tools/list", headers={"authorization": "Bearer "}).status_code == 401
 
 
 def test_initialize_and_list(settings):
     client, _ = _client(settings)
-    r = _rpc(client, "initialize", {"protocolVersion": "2025-03-26", "capabilities": {}})
+    r = _rpc(client, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}})
     res = r.json()["result"]
-    assert res["protocolVersion"] == "2025-03-26" and "tools" in res["capabilities"]
+    assert res["protocolVersion"] == "2025-06-18" and "tools" in res["capabilities"]
     note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
     assert client.post("/mcp", json=note, headers=AUTH).status_code == 202
     names = [t["name"] for t in _rpc(client, "tools/list").json()["result"]["tools"]]
     assert names == ["place_call", "list_calls", "hang_up"]
     assert _rpc(client, "nope").json()["error"]["code"] == -32601
+    assert _rpc(client, "tools/list", [1]).json()["error"]["code"] == -32602
+    reply = {"jsonrpc": "2.0", "id": 9, "result": {}}
+    assert client.post("/mcp", json=reply, headers=AUTH).status_code == 202
 
 
 def test_place_call_respects_guards(settings):
@@ -65,11 +75,13 @@ def test_place_call_respects_guards(settings):
     assert err
 
 
-def test_list_calls_and_hang_up(settings):
-    client, _ = _client(settings)
+def test_list_calls_outbound_only_and_hang_up(settings):
+    client, manager = _client(settings)
+    manager._record("in_1", "inbound", "+16045550123", "+16045550100")
     _tool(client, "place_call", {"number": "+16045550111", "briefing": "a"})
     err, data = _tool(client, "list_calls", {"limit": 5})
-    assert not err and len(data["calls"]) == 1 and data["calls"][0]["direction"] == "outbound"
+    assert not err and len(data["calls"]) == 1 and data["calls"][0]["to"] == "+16045550111"
+    assert "from" not in data["calls"][0]
     err, data = _tool(client, "hang_up", {"call_id": "missing"})
     assert err and "no such" in data["error"]
     r = _rpc(client, "tools/call", {"name": "unknown", "arguments": {}})

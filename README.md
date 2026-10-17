@@ -40,7 +40,8 @@ caller ──PSTN──> carrier DID ──SIP/TLS──> sip:+1NXXNXXXXXX@sip.v
 The server exposes a small MCP connector at `https://<PUBLIC_HOSTNAME>/mcp` (Streamable HTTP,
 stateless). Tools: `place_call(number, briefing)`, `list_calls(limit)`, `hang_up(call_id)`.
 It uses the same guards as `POST /call` (allow list, no emergency numbers, AI greeting).
-Auth is `Authorization: Bearer <API_TOKEN>`.
+Auth is a static `Authorization: Bearer <API_TOKEN>` (no OAuth); use 32+ random chars
+(`openssl rand -hex 32`). `list_calls` returns outbound calls only.
 
 ```bash
 # Grok CLI
