@@ -41,6 +41,7 @@ END_CALL_TOOL = {
 }
 EMERGENCY = {"911", "112", "999", "000", "988", "110", "119"}
 BACKSTOP_SECONDS = 10.0
+GREET_AFTER_SECONDS = 4.0
 
 
 DISCLOSURE = "I am an AI assistant, not a human. I cannot contact emergency services."
@@ -58,8 +59,16 @@ def instructions_for(settings, briefing: str = "", inbound: bool = False) -> str
         "emergency number themselves. Do not claim the call is being recorded.\n"
         f"Additional persona notes:\n{settings.instructions}\n"
         f"Purpose of this call:\n{purpose}\n"
+        f"{'' if inbound else _wait_line(settings)}"
         "Keep turns short. When the task is done, say goodbye, then use the end_call tool. "
         "Never use end_call just because the other person said goodbye or hang up."
+    )
+
+
+def _wait_line(settings) -> str:
+    line = f"{DISCLOSURE} {settings.greeting}".strip()
+    return (
+        f'You placed this call. Let them speak first, then begin your first reply with: "{line}"\n'
     )
 
 
@@ -315,6 +324,7 @@ class OutboundCall(Call):
         self.sip: SipClient | None = None
         self.audio: AlsaLoop | None = None
         self._muted = False
+        self._heard = False
 
     async def _hangup_leg(self) -> None:
         if self.sip is not None:
@@ -322,6 +332,8 @@ class OutboundCall(Call):
 
     async def on_event(self, event: dict) -> None:
         etype = event.get("type")
+        if etype in ("input_audio_buffer.speech_started", "response.created"):
+            self._heard = True
         if etype == "response.created":
             self._muted = False
         elif etype == "response.output_audio.delta" and self.audio is not None and not self._muted:
@@ -331,6 +343,12 @@ class OutboundCall(Call):
                 self.play_until = max(self.play_until, time.monotonic()) + len(pcm) / 16000
                 await self.audio.write(pcm)
         await super().on_event(event)
+
+    async def _greet_if_silent(self) -> None:
+        await asyncio.sleep(GREET_AFTER_SECONDS)
+        if not self._heard and not self._hung_up:
+            self._heard = True
+            await self.send(opening_event(self.settings, self.briefing))
 
     async def on_interrupt(self) -> None:
         """Caller started talking: xAI already cancels its response; we only drop the
@@ -372,7 +390,9 @@ class OutboundCall(Call):
                     return
                 self.record["status"] = "in_progress"
                 self.started = self.last_activity = time.monotonic()
-                await self.send(opening_event(s, self.briefing))
+                # Wait for "hello": xAI's turn detection makes the first reply. Greet anyway
+                # if nobody speaks soon.
+                self.manager.spawn(self._greet_if_silent())
                 await self._relay(ws)
         except Exception as exc:  # noqa: BLE001
             self.record["error"] = self.record.get("error") or type(exc).__name__

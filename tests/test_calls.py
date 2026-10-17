@@ -203,3 +203,26 @@ async def test_outbound_barge_in_drops_queued_speech(settings):
     await call.on_event({"type": "response.created"})
     await call.on_event(chunk)
     assert len(call.audio.written) == 2
+
+
+async def test_outbound_waits_for_hello_then_greets_as_backstop(settings, monkeypatch):
+    monkeypatch.setattr(calls, "GREET_AFTER_SECONDS", 0.01)
+    manager = CallManager(settings, xai=FakeXai())
+    call = OutboundCall(manager, "out_1", _record(), "+16045550111", "")
+    call.ws, call.sip = FakeWS(), FakeSip()
+    await call._greet_if_silent()  # nobody spoke: greet anyway
+    assert [m["type"] for m in call.ws.sent] == ["response.create"]
+    heard = OutboundCall(manager, "out_2", _record(), "+16045550111", "")
+    heard.ws, heard.sip = FakeWS(), FakeSip()
+    await heard.on_event({"type": "input_audio_buffer.speech_started"})
+    await heard._greet_if_silent()  # callee said hello: xAI replies on its own
+    assert heard.ws.sent == []
+
+
+def test_outbound_persona_says_wait_for_hello(settings):
+    from ringabot.calls import DISCLOSURE, session_config
+
+    outbound = session_config(settings, "x")["session"]["instructions"]
+    inbound = session_config(settings, inbound=True)["session"]["instructions"]
+    assert "Let them speak first" in outbound and DISCLOSURE in outbound
+    assert "Let them speak first" not in inbound
