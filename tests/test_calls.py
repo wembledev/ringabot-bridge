@@ -240,10 +240,14 @@ def test_outbound_persona_says_wait_for_hello(settings):
     assert "Let them speak first" not in inbound
 
 
-def test_every_call_opens_with_hello_then_disclosure(settings):
-    from ringabot.calls import DISCLOSURE, opening_line, session_config
+def test_every_call_opens_with_the_short_greeting(settings):
+    from dataclasses import replace
 
-    assert opening_line(settings).startswith(f"Hello! {DISCLOSURE}")
+    from ringabot.calls import DEFAULT_GREETING, opening_line, session_config
+
+    assert opening_line(replace(settings, greeting="")) == DEFAULT_GREETING
+    custom = replace(settings, greeting="Hi, this is the test line's AI assistant.")
+    assert opening_line(custom) == "Hi, this is the test line's AI assistant."
     for inbound in (True, False):
         instructions = session_config(settings, inbound=inbound)["session"]["instructions"]
         assert opening_line(settings) in instructions
