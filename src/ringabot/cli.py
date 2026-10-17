@@ -28,7 +28,7 @@ async def _doctor(s: Settings) -> int:
         line(True, "XAI_WEBHOOK_SECRET set and well formed")
     except SignatureError as exc:
         line(False, f"XAI_WEBHOOK_SECRET: {exc}")
-    line(bool(s.api_token), "API_TOKEN set (admin endpoints)")
+    line(len(s.api_token) >= 32, "API_TOKEN set, 32+ chars (admin + public /mcp)")
     line(bool(s.did), "DID set")
     line(s.public_url.startswith("https://"), "PUBLIC_URL is https")
     line(s.host in ("127.0.0.1", "::1", "localhost"), f"listener bound to loopback ({s.host})")

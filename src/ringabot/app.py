@@ -13,6 +13,7 @@ from starlette.routing import Route
 
 from ringabot.calls import CallManager
 from ringabot.config import Settings
+from ringabot.mcp import make_endpoint
 from ringabot.signature import SignatureError, Verifier
 
 log = logging.getLogger("ringabot.app")
@@ -22,8 +23,10 @@ MAX_BODY = 64 * 1024
 def _bearer_ok(request: Request, token: str) -> bool:
     if not token:
         return False
-    got = request.headers.get("authorization", "")
-    return hmac.compare_digest(got.encode(), f"Bearer {token}".encode())
+    scheme, _, got = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    return hmac.compare_digest(got.strip().encode(), token.encode())
 
 
 def create_app(settings: Settings | None = None, manager: CallManager | None = None) -> Starlette:
@@ -95,5 +98,10 @@ def create_app(settings: Settings | None = None, manager: CallManager | None = N
             Route("/call", place_call, methods=["POST"]),
             Route("/calls", list_calls),
             Route("/calls/{call_id}/hangup", hangup, methods=["POST"]),
+            Route(
+                "/mcp",
+                make_endpoint(manager, lambda r: _bearer_ok(r, settings.api_token)),
+                methods=["POST"],
+            ),
         ]
     )
