@@ -1,5 +1,6 @@
 import json
 import time
+from dataclasses import replace
 
 from starlette.testclient import TestClient
 
@@ -8,22 +9,24 @@ from ringabot.app import create_app
 from ringabot.calls import CallManager
 from ringabot.signature import sign
 
+AUTH = {"authorization": "Bearer admin-placeholder"}
+
 
 class NoRunManager(CallManager):
-    """Records accepted calls without opening a websocket."""
+    """Records calls without opening sockets or starting baresip."""
 
     def spawn(self, coro):
         coro.close()
 
 
-def _post(client, payload, msg_id="msg_a", secret=SECRET, extra=None):
+def _post(client, payload, msg_id="msg_a", extra=None):
     body = json.dumps(payload).encode()
     ts = str(int(time.time()))
     headers = {
         "content-type": "application/json",
         "webhook-id": msg_id,
         "webhook-timestamp": ts,
-        "webhook-signature": sign(secret, msg_id, ts, body),
+        "webhook-signature": sign(SECRET, msg_id, ts, body),
         **(extra or {}),
     }
     return client.post("/xai/webhook", content=body, headers=headers)
@@ -31,10 +34,7 @@ def _post(client, payload, msg_id="msg_a", secret=SECRET, extra=None):
 
 def _incoming(call_id="c1", to="+16045550100"):
     return {
-        "object": "event",
-        "id": "evt_1",
         "type": "realtime.call.incoming",
-        "created_at": 1,
         "data": {
             "call_id": call_id,
             "sip_headers": [{"name": "From", "value": "+16045550123"}, {"name": "To", "value": to}],
@@ -59,13 +59,11 @@ def test_incoming_call_accepted_fast(settings):
     assert r.status_code == 200 and r.json()["accepted"] is True
     assert time.monotonic() - started < 0.5
     assert "c1" in manager.active
-    assert manager.recent[0]["from"] == "+16045550123"
 
 
 def test_unsigned_webhook_rejected(settings):
     client, manager = _client(settings)
-    r = client.post("/xai/webhook", content=b"{}")
-    assert r.status_code == 401
+    assert client.post("/xai/webhook", content=b"{}").status_code == 401
     assert not manager.active
 
 
@@ -76,35 +74,42 @@ def test_wrong_number_refused(settings):
 
 
 def test_busy_limit(settings):
-    client, manager = _client(settings)
+    client, _ = _client(settings)
     for i in range(settings.max_concurrent_calls):
         _post(client, _incoming(call_id=f"c{i}"), msg_id=f"m{i}")
-    r = _post(client, _incoming(call_id="cx"), msg_id="mx")
-    assert r.json()["detail"] == "busy"
+    assert _post(client, _incoming(call_id="cx"), msg_id="mx").json()["detail"] == "busy"
 
 
 def test_bearer_required_when_configured(settings):
-    from dataclasses import replace
-
-    s = replace(settings, webhook_bearer="bearer-placeholder")
-    client, _ = _client(s)
+    client, _ = _client(replace(settings, webhook_bearer="bearer-placeholder"))
     assert _post(client, _incoming()).status_code == 401
-    ok = _post(
-        client,
-        _incoming(),
-        msg_id="m2",
-        extra={"authorization": "Bearer bearer-placeholder"},
-    )
-    assert ok.status_code == 200
+    extra = {"authorization": "Bearer bearer-placeholder"}
+    assert _post(client, _incoming(), msg_id="m2", extra=extra).status_code == 200
 
 
-def test_admin_endpoints_need_token(settings):
+def test_admin_routes_need_token(settings):
     client, _ = _client(settings)
     assert client.get("/calls").status_code == 401
-    auth = {"authorization": "Bearer admin-placeholder"}
-    assert client.get("/calls", headers=auth).status_code == 200
-    assert client.post("/calls/outbound", headers=auth).status_code == 501
-    assert client.post("/calls/nope/hangup", headers=auth).status_code == 404
+    assert client.post("/call", json={"number": "+16045550111"}).status_code == 401
+    assert client.get("/calls", headers=AUTH).status_code == 200
+    assert client.post("/calls/nope/hangup", headers=AUTH).status_code == 404
+
+
+def test_place_call_checks_allowlist_and_emergency(settings):
+    client, manager = _client(settings)
+    ok = client.post("/call", headers=AUTH, json={"number": "6045550111", "briefing": "hi"})
+    assert ok.status_code == 202 and ok.json()["call_id"].startswith("out_")
+    assert manager.recent[0]["direction"] == "outbound"
+    assert manager.recent[0]["to"] == "+16045550111"
+    bad = client.post("/call", headers=AUTH, json={"number": "+16045550199"})
+    assert bad.status_code == 400
+    assert client.post("/call", headers=AUTH, json={"number": "911"}).status_code == 400
+
+
+def test_place_call_needs_sip_settings(settings):
+    client, _ = _client(replace(settings, sip_password=""))
+    r = client.post("/call", headers=AUTH, json={"number": "+16045550111"})
+    assert r.status_code == 400 and "not configured" in r.json()["error"]
 
 
 def test_other_event_types_ignored(settings):

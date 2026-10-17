@@ -1,24 +1,46 @@
-"""One asyncio task per call: join the xAI realtime session by call_id and run tools.
+"""Inbound and outbound calls, one asyncio task each.
 
-Audio never touches this process. xAI bridges the SIP caller; we only exchange JSON
-control events (config, transcripts, tool calls), so a 1 GB box handles it easily.
+Inbound: xAI answers the SIP call itself; we join by call_id over a websocket and only
+exchange JSON events. Outbound: baresip dials through the carrier and we relay 8 kHz PCM
+between snd-aloop and the xAI realtime websocket.
+
+Hang-up follows the same pattern as the voice agent we already run: the agent says
+goodbye itself, then calls end_call; we reply "hanging up", let that last response
+finish playing, wait a short tail, and send exactly one hang-up. A backstop timer,
+an idle timeout and a max call length make sure no call stays open.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
 import time
+import uuid
 from collections import deque
+from pathlib import Path
 
 import websockets
 
-from ringabot.tools import run_tool, tool_definitions
+from ringabot.audio import SAMPLE_RATE, AlsaLoop
+from ringabot.sip import SipClient, dial_uri, start_baresip
 from ringabot.xai import XaiClient
 
 log = logging.getLogger("ringabot.calls")
+
+END_CALL_TOOL = {
+    "type": "function",
+    "name": "end_call",
+    "description": (
+        "End the phone call. Use only after you have said goodbye yourself. "
+        "Never use it just because the other person said goodbye or hang up."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+EMERGENCY = {"911", "112", "999", "000", "988", "110", "119"}
+BACKSTOP_SECONDS = 10.0
 
 
 def _header(sip_headers: list, name: str) -> str:
@@ -28,143 +50,316 @@ def _header(sip_headers: list, name: str) -> str:
     return ""
 
 
-class CallSession:
+def e164(number: str) -> str:
+    digits = "".join(ch for ch in number if ch.isdigit())
+    if len(digits) == 10:
+        digits = "1" + digits
+    return "+" + digits
+
+
+class Call:
+    """Shared event handling, end_call, timeouts and the single hang-up."""
+
+    tail_seconds = 1.0
+
     def __init__(self, manager: CallManager, call_id: str, record: dict):
         self.manager = manager
         self.settings = manager.settings
         self.call_id = call_id
         self.record = record
-        self._hangup_requested = False
-        self._ws = None
+        self.ws = None
+        self.armed = False
+        self._goodbye_started = False
+        self._hung_up = False
+        self.last_activity = time.monotonic()
+        self.started = time.monotonic()
 
-    def request_hangup(self) -> None:
-        self._hangup_requested = True
-        # Fallback in case response.done never arrives.
-        self.manager.spawn(self._hangup_later(8.0))
-
-    async def _hangup_later(self, delay: float) -> None:
-        await asyncio.sleep(delay)
-        await self.hangup("end_call")
-
-    def start_transfer(self, uri: str) -> None:
-        self.manager.spawn(self._transfer(uri))
-
-    async def _transfer(self, uri: str) -> None:
-        await asyncio.sleep(1.5)  # let the agent say "one moment"
-        status, _ = await self.manager.xai.refer(self.call_id, uri)
-        self.record["events"].append({"t": time.time(), "transfer_status": status})
-        log.info("call %s transfer status %s", self.call_id, status)
-
+    # -- hang-up -----------------------------------------------------------
     async def hangup(self, reason: str) -> None:
-        if self.record.get("ended_at"):
+        if self._hung_up:
             return
+        self._hung_up = True
         self.record["end_reason"] = self.record.get("end_reason") or reason
+        log.info("call %s hanging up (%s)", self.call_id, reason)
         with contextlib.suppress(Exception):
-            await self.manager.xai.hangup(self.call_id)
+            await self._hangup_leg()
 
-    async def _send(self, event: dict) -> None:
-        await self._ws.send(json.dumps(event))
+    async def _hangup_leg(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def arm(self, reason: str) -> None:
+        """Hang up after the next response finishes playing (or the backstop)."""
+        if self.armed:
+            return
+        self.armed = True
+        self.record["end_reason"] = self.record.get("end_reason") or reason
+        self.manager.spawn(self._backstop())
+
+    async def _backstop(self) -> None:
+        await asyncio.sleep(BACKSTOP_SECONDS)
+        await self.hangup(self.record.get("end_reason") or "backstop")
+
+    async def _after_tail(self) -> None:
+        await asyncio.sleep(self.tail_seconds)
+        await self.hangup(self.record.get("end_reason") or "end_call")
+
+    async def say_goodbye(self, reason: str) -> None:
+        if self.armed:
+            return
+        self.arm(reason)
+        await self.send(
+            {
+                "type": "response.create",
+                "response": {"instructions": "Say one short goodbye now. The call is ending."},
+            }
+        )
+
+    async def watchdog(self) -> None:
+        s = self.settings
+        while not self._hung_up:
+            await asyncio.sleep(1.0)
+            now = time.monotonic()
+            if now - self.started >= s.max_call_seconds:
+                await self.say_goodbye("max_call_seconds")
+            elif now - self.last_activity >= s.idle_seconds:
+                await self.say_goodbye("idle")
+
+    # -- realtime events ---------------------------------------------------
+    async def send(self, event: dict) -> None:
+        if self.ws is not None:
+            with contextlib.suppress(websockets.ConnectionClosed):
+                await self.ws.send(json.dumps(event))
+
+    async def on_event(self, event: dict) -> None:
+        etype = event.get("type", "")
+        transcript = self.record["transcript"]
+        if etype in ("input_audio_buffer.speech_started", "response.output_audio.delta"):
+            self.last_activity = time.monotonic()
+        elif etype == "conversation.item.input_audio_transcription.completed":
+            self.last_activity = time.monotonic()
+            transcript.append({"role": "caller", "text": event.get("transcript", "")})
+        elif etype == "response.output_audio_transcript.done":
+            transcript.append({"role": "agent", "text": event.get("transcript", "")})
+        elif etype == "response.function_call_arguments.done":
+            await self._tool(event)
+        elif etype == "response.created" and self.armed:
+            self._goodbye_started = True
+        elif etype == "response.done" and self.armed and self._goodbye_started:
+            self.manager.spawn(self._after_tail())
+        elif etype == "error":
+            log.warning("call %s realtime error: %s", self.call_id, str(event.get("error"))[:200])
+        del transcript[:-200]
+
+    async def _tool(self, event: dict) -> None:
+        name = event.get("name", "")
+        self.record["tools"].append(name)
+        output = {"status": "hanging up"} if name == "end_call" else {"error": "unknown tool"}
+        await self.send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": event.get("call_id"),
+                    "output": json.dumps(output),
+                },
+            }
+        )
+        if name == "end_call":
+            self.arm("end_call")
+        await self.send({"type": "response.create"})
+
+    def finish(self) -> None:
+        self._hung_up = True
+        self.record["status"] = "ended"
+        self.record["ended_at"] = time.time()
+        log.info(
+            "call %s ended (%s) after %ss",
+            self.call_id,
+            self.record.get("end_reason") or "remote",
+            int(self.record["ended_at"] - self.record["started_at"]),
+        )
+
+
+class InboundCall(Call):
+    """xAI owns the SIP leg and plays audio; we only see events, so wait a bit longer."""
+
+    tail_seconds = 2.0
+
+    async def _hangup_leg(self) -> None:
+        await self.manager.xai.hangup(self.call_id)
 
     async def run(self) -> None:
         s = self.settings
         url = f"{s.realtime_url}?call_id={self.call_id}"
         headers = {"Authorization": f"Bearer {s.xai_api_key}"}
         try:
-            async with websockets.connect(
-                url, additional_headers=headers, max_size=2**22, open_timeout=10
-            ) as ws:
-                self._ws = ws
-                await self._send(
+            async with websockets.connect(url, additional_headers=headers, open_timeout=10) as ws:
+                self.ws = ws
+                await self.send(
                     {
                         "type": "session.update",
                         "session": {
                             "voice": s.voice,
                             "instructions": s.instructions,
                             "turn_detection": {"type": "server_vad"},
-                            "tools": tool_definitions(s),
+                            "tools": [END_CALL_TOOL],
                         },
                     }
                 )
-                await self._send(
+                await self.send(
                     {
                         "type": "response.create",
                         "response": {"instructions": f"{s.instructions}\n\n{s.greeting}"},
                     }
                 )
                 self.record["status"] = "in_progress"
-                await asyncio.wait_for(self._loop(ws), timeout=s.max_call_seconds)
-        except TimeoutError:
-            await self.hangup("max_call_seconds")
+                dog = self.manager.spawn(self.watchdog())
+                try:
+                    async for raw in ws:
+                        if isinstance(raw, str):
+                            with contextlib.suppress(json.JSONDecodeError):
+                                await self.on_event(json.loads(raw))
+                finally:
+                    dog.cancel()
         except websockets.ConnectionClosed:
             pass
         except Exception as exc:  # noqa: BLE001
             self.record["error"] = type(exc).__name__
             log.warning("call %s failed: %s", self.call_id, type(exc).__name__)
         finally:
-            self.record["status"] = "ended"
-            self.record["ended_at"] = time.time()
-            log.info(
-                "call %s ended (%s) after %ss",
-                self.call_id,
-                self.record.get("end_reason") or "remote",
-                int(self.record["ended_at"] - self.record["started_at"]),
+            self.finish()
+
+
+class OutboundCall(Call):
+    """baresip dials; PCM is relayed between snd-aloop and the realtime websocket."""
+
+    def __init__(self, manager, call_id, record, number: str, briefing: str, opening: str):
+        super().__init__(manager, call_id, record)
+        self.number = number
+        self.briefing = briefing
+        self.opening = opening
+        self.sip: SipClient | None = None
+        self.audio: AlsaLoop | None = None
+
+    async def _hangup_leg(self) -> None:
+        if self.sip is not None:
+            await self.sip.command("hangup")
+
+    async def on_event(self, event: dict) -> None:
+        if event.get("type") == "response.output_audio.delta" and self.audio is not None:
+            with contextlib.suppress(Exception):
+                await self.audio.write(base64.b64decode(event.get("delta") or ""))
+        await super().on_event(event)
+
+    async def run(self) -> None:
+        s = self.settings
+        baresip = None
+        try:
+            self.audio = AlsaLoop()
+            await self.audio.start()
+            baresip = await start_baresip(
+                work_dir=Path(s.work_dir),
+                pcm=self.audio.baresip_device,
+                user=s.sip_username,
+                password=s.sip_password,
+                server=s.sip_server,
+                did=e164(s.did).lstrip("+"),
             )
+            self.sip = SipClient(baresip.port)
+            await self.sip.connect()
+            headers = {"Authorization": f"Bearer {s.xai_api_key}"}
+            async with websockets.connect(
+                s.realtime_url, additional_headers=headers, open_timeout=10, max_size=2**20
+            ) as ws:
+                self.ws = ws
+                fmt = {"type": "audio/pcm", "rate": SAMPLE_RATE}
+                asr = {"model": "grok-transcribe"}
+                instructions = s.instructions
+                if self.briefing:
+                    instructions += f"\n\nYou placed this call. Briefing: {self.briefing}"
+                await self.send(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "voice": s.voice,
+                            "instructions": instructions,
+                            "turn_detection": {"type": "server_vad"},
+                            "tools": [END_CALL_TOOL],
+                            "audio": {
+                                "input": {"format": fmt, "transcription": asr},
+                                "output": {"format": fmt},
+                            },
+                        },
+                    }
+                )  # fmt: skip
+                self.record["status"] = "dialing"
+                await self.sip.command(f"dial {dial_uri(self.number, s.sip_server)}")
+                ev = await self.sip.wait_type("CALL_ESTABLISHED", "CALL_CLOSED", timeout=60)
+                if ev.get("type") != "CALL_ESTABLISHED":
+                    self.record["error"] = "not_answered"
+                    self.record["end_reason"] = "not_answered"
+                    return
+                self.record["status"] = "in_progress"
+                self.started = self.last_activity = time.monotonic()
+                await self.send(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "force_message",
+                            "role": "assistant",
+                            "interruptible": False,
+                            "content": [{"type": "output_text", "text": self.opening}],
+                        },
+                    }
+                )
+                self.record["transcript"].append({"role": "agent", "text": self.opening})
+                await self._relay(ws)
+        except Exception as exc:  # noqa: BLE001
+            self.record["error"] = self.record.get("error") or type(exc).__name__
+            log.warning("call %s failed: %s", self.call_id, type(exc).__name__)
+        finally:
+            await self.hangup(self.record.get("end_reason") or "remote_hangup")
+            if self.sip is not None:
+                await self.sip.close()
+            if baresip is not None:
+                await baresip.stop()
+            if self.audio is not None:
+                await self.audio.stop()
+            self.finish()
 
-    async def _loop(self, ws) -> None:
-        async for raw in ws:
-            if isinstance(raw, bytes):
-                continue  # audio frames are not expected; ignore
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            await self.handle(event)
+    async def _relay(self, ws) -> None:
+        async def mic() -> None:
+            while (pcm := await self.audio.read()) is not None:
+                await self.send(
+                    {"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode()}
+                )
 
-    async def handle(self, event: dict) -> None:
-        etype = event.get("type", "")
-        transcript = self.record["transcript"]
-        if etype == "conversation.item.input_audio_transcription.completed":
-            transcript.append({"role": "caller", "text": event.get("transcript", "")})
-        elif etype == "response.output_audio_transcript.done":
-            transcript.append({"role": "agent", "text": event.get("transcript", "")})
-        elif etype == "response.function_call_arguments.done":
-            self.manager.spawn(self._tool(event))
-        elif etype == "response.done" and self._hangup_requested:
-            self.manager.spawn(self._hangup_later(1.0))
-        elif etype == "error":
-            err = event.get("error") or {}
-            self.record["events"].append({"t": time.time(), "error": str(err)[:200]})
-            log.warning("call %s realtime error: %s", self.call_id, str(err)[:200])
-        del transcript[:-200]
+        async def voice() -> None:
+            async for raw in ws:
+                if isinstance(raw, str):
+                    with contextlib.suppress(json.JSONDecodeError):
+                        await self.on_event(json.loads(raw))
 
-    async def _tool(self, event: dict) -> None:
-        name = event.get("name", "")
-        started = time.monotonic()
-        result = await run_tool(self, name, event.get("arguments") or "{}")
-        ms = int((time.monotonic() - started) * 1000)
-        self.record["tools"].append({"name": name, "ok": "error" not in result, "ms": ms})
-        log.info("call %s tool %s (%sms)", self.call_id, name, ms)
-        if self._ws is None:
-            return
-        with contextlib.suppress(websockets.ConnectionClosed):
-            await self._send(
-                {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": event.get("call_id"),
-                        "output": json.dumps(result),
-                    },
-                }
-            )
-            await self._send({"type": "response.create"})
+        async def remote() -> None:
+            while (await self.sip.events.get()).get("type") not in ("CALL_CLOSED", "EOF"):
+                pass
+            if not self._hung_up:
+                self.record["end_reason"] = self.record.get("end_reason") or "remote_hangup"
+                self._hung_up = True  # the far end already hung up; no BYE needed
+
+        tasks = [asyncio.create_task(c()) for c in (mic, voice, remote, self.watchdog)]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for t in tasks:
+                t.cancel()
 
 
 class CallManager:
     def __init__(self, settings, xai: XaiClient | None = None):
         self.settings = settings
         self.xai = xai or XaiClient(settings.xai_api_key, settings.api_base)
-        self.active: dict[str, CallSession] = {}
+        self.active: dict[str, Call] = {}
         self.recent: deque[dict] = deque(maxlen=settings.keep_calls)
         self._tasks: set[asyncio.Task] = set()
 
@@ -173,6 +368,31 @@ class CallManager:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
+
+    def _record(self, call_id: str, direction: str, frm: str, to: str) -> dict:
+        record = {
+            "call_id": call_id,
+            "direction": direction,
+            "from": frm,
+            "to": to,
+            "started_at": time.time(),
+            "status": "connecting",
+            "transcript": [],
+            "tools": [],
+        }
+        self.recent.appendleft(record)
+        return record
+
+    def _start(self, call: Call) -> None:
+        self.active[call.call_id] = call
+
+        async def runner():
+            try:
+                await call.run()
+            finally:
+                self.active.pop(call.call_id, None)
+
+        self.spawn(runner())
 
     def accept(self, data: dict) -> tuple[bool, str]:
         """Called from the webhook handler; must return fast. Work runs in a task."""
@@ -183,32 +403,31 @@ class CallManager:
             return True, "duplicate"
         sip = data.get("sip_headers") or []
         to = _header(sip, "To")
-        if self.settings.did and self.settings.did.lstrip("+") not in to.replace("+", ""):
+        if self.settings.did and e164(self.settings.did)[1:] not in to.replace("+", ""):
             return False, "not our number"
         if len(self.active) >= self.settings.max_concurrent_calls:
             self.spawn(self.xai.hangup(call_id))
             return False, "busy"
-        record = {
-            "call_id": call_id,
-            "direction": "inbound",
-            "from": _header(sip, "From"),
-            "to": to,
-            "started_at": time.time(),
-            "status": "connecting",
-            "transcript": [],
-            "tools": [],
-            "events": [],
-        }
-        self.recent.appendleft(record)
-        session = CallSession(self, call_id, record)
-        self.active[call_id] = session
+        record = self._record(call_id, "inbound", _header(sip, "From"), to)
         log.info("call %s incoming", call_id)
-
-        async def runner():
-            try:
-                await session.run()
-            finally:
-                self.active.pop(call_id, None)
-
-        self.spawn(runner())
+        self._start(InboundCall(self, call_id, record))
         return True, "accepted"
+
+    def place(self, number: str, briefing: str = "", opening: str = "") -> tuple[str | None, str]:
+        s = self.settings
+        if not s.outbound_ready:
+            return None, "outbound not configured"
+        digits = "".join(ch for ch in number if ch.isdigit())
+        if digits in EMERGENCY or len(digits) < 10:
+            return None, "number not allowed"
+        target = e164(number)
+        if not any(target.startswith(p) for p in s.allowed_destinations):
+            return None, "number not in ALLOWED_DESTINATIONS"
+        if len(self.active) >= s.max_concurrent_calls:
+            return None, "busy"
+        call_id = "out_" + uuid.uuid4().hex[:16]
+        record = self._record(call_id, "outbound", e164(s.did), target)
+        opening = opening or "Hi, I'm an AI assistant, not a human."
+        self._start(OutboundCall(self, call_id, record, target, briefing[:2000], opening[:300]))
+        log.info("call %s outbound dialing", call_id)
+        return call_id, "dialing"

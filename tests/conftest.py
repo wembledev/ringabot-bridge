@@ -10,15 +10,10 @@ SECRET = "whsec_" + base64.b64encode(b"k" * 32).decode()
 class FakeXai:
     def __init__(self):
         self.hangups: list[str] = []
-        self.refers: list[tuple[str, str]] = []
 
     async def hangup(self, call_id):
         self.hangups.append(call_id)
         return 200
-
-    async def refer(self, call_id, uri):
-        self.refers.append((call_id, uri))
-        return 200, "{}"
 
 
 @pytest.fixture
@@ -29,6 +24,10 @@ def settings():
             "XAI_WEBHOOK_SECRET": SECRET,
             "API_TOKEN": "admin-placeholder",
             "DID": "6045550100",
-            "TRANSFER_TARGETS": "desk=tel:+16045550111",
+            "SIP_SERVER": "pop.example.net",
+            "SIP_USERNAME": "100000_test",
+            "SIP_PASSWORD": "sip-placeholder",
+            "ALLOWED_DESTINATIONS": "+16045550111",
+            "IDLE_TIMEOUT": "30",
         }
     )

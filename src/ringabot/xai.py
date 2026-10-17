@@ -1,4 +1,4 @@
-"""Small xAI REST client: call control and Direct SIP phone numbers."""
+"""Small xAI REST client: SIP call hang-up and Direct SIP phone numbers."""
 
 from __future__ import annotations
 
@@ -18,16 +18,6 @@ class XaiClient:
     async def hangup(self, call_id: str) -> int:
         r = await self._req("POST", f"/v1/realtime/calls/{call_id}/hangup")
         return r.status_code
-
-    async def refer(self, call_id: str, target_uri: str) -> tuple[int, str]:
-        # Blocks until the transfer resolves (xAI docs); allow a long timeout.
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            r = await client.post(
-                f"{self._base}/v1/realtime/calls/{call_id}/refer",
-                headers=self._headers,
-                json={"target_uri": target_uri},
-            )
-        return r.status_code, r.text[:300]
 
     async def list_numbers(self) -> list[dict]:
         r = await self._req("GET", "/v2/phone-numbers", params={"limit": 100})

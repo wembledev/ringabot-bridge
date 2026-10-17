@@ -1,0 +1,61 @@
+"""8 kHz S16 mono duplex over one snd-aloop substream (baresip <-> this process)."""
+
+from __future__ import annotations
+
+import asyncio
+import shutil
+
+SAMPLE_RATE = 8000
+_used: set[int] = set()
+
+
+class AudioUnavailable(RuntimeError):
+    pass
+
+
+class AlsaLoop:
+    def __init__(self) -> None:
+        for n in range(1, 8):
+            if n not in _used:
+                _used.add(n)
+                self.substream = n
+                break
+        else:
+            raise AudioUnavailable("alsa_substreams_full")
+        self.baresip_device = f"hw:Loopback,0,{self.substream}"
+        self._device = f"hw:Loopback,1,{self.substream}"
+        self._capture: asyncio.subprocess.Process | None = None
+        self._playback: asyncio.subprocess.Process | None = None
+
+    async def start(self) -> None:
+        if shutil.which("arecord") is None or shutil.which("aplay") is None:
+            raise AudioUnavailable("alsa-utils is not installed")
+        common = ["-D", self._device, "-f", "S16_LE", "-r", str(SAMPLE_RATE), "-c", "1",
+                  "-t", "raw", "--period-time=20000", "--buffer-time=80000"]  # fmt: skip
+        self._capture = await asyncio.create_subprocess_exec(
+            "arecord", *common, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        )
+        self._playback = await asyncio.create_subprocess_exec(
+            "aplay", *common, stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        )
+
+    async def read(self) -> bytes | None:
+        if self._capture is None or self._capture.stdout is None:
+            return None
+        return await self._capture.stdout.read(320) or None
+
+    async def write(self, pcm: bytes) -> None:
+        if self._playback is None or self._playback.stdin is None:
+            return
+        self._playback.stdin.write(pcm)
+        await self._playback.stdin.drain()
+
+    async def stop(self) -> None:
+        for proc in (self._capture, self._playback):
+            if proc is not None and proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except TimeoutError:
+                    proc.kill()
+        _used.discard(self.substream)

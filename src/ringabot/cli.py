@@ -38,11 +38,14 @@ async def _doctor(s: Settings) -> int:
     line(bool(s.did), "DID set")
     line(s.public_url.startswith("https://"), "PUBLIC_URL is https")
     line(s.host in ("127.0.0.1", "::1", "localhost"), f"listener bound to loopback ({s.host})")
-    try:
-        s.extra_tools()
-        line(True, "TOOLS_FILE parses (or unset)")
-    except Exception as exc:  # noqa: BLE001
-        line(False, f"TOOLS_FILE: {type(exc).__name__}")
+    line(s.outbound_ready, "outbound SIP settings present (SIP_SERVER, SIP_USERNAME, SIP_PASSWORD)")
+    if s.outbound_ready:
+        import shutil
+        from pathlib import Path
+
+        line(shutil.which("baresip") is not None, "baresip installed")
+        line(Path("/proc/asound/Loopback").exists(), "snd-aloop loaded")
+        line(bool(s.allowed_destinations), "ALLOWED_DESTINATIONS set")
     if s.xai_api_key:
         try:
             numbers = await XaiClient(s.xai_api_key, s.api_base).list_numbers()

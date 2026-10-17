@@ -1,9 +1,12 @@
 import asyncio
 import json
+import time
 
+import pytest
+
+import ringabot.calls as calls
 from conftest import FakeXai
-from ringabot.calls import CallManager, CallSession
-from ringabot.tools import tool_definitions
+from ringabot.calls import CallManager, InboundCall, OutboundCall
 
 
 class FakeWS:
@@ -14,107 +17,113 @@ class FakeWS:
         self.sent.append(json.loads(raw))
 
 
-def _session(settings):
+class FakeSip:
+    def __init__(self):
+        self.commands: list[str] = []
+
+    async def command(self, line):
+        self.commands.append(line)
+
+
+def _record():
+    return {"call_id": "c1", "started_at": time.time(), "transcript": [], "tools": []}
+
+
+def _inbound(settings):
     manager = CallManager(settings, xai=FakeXai())
-    record = {
-        "call_id": "c1",
-        "from": "+16045550123",
-        "started_at": 0,
-        "transcript": [],
-        "tools": [],
-        "events": [],
-    }
-    s = CallSession(manager, "c1", record)
-    s._ws = FakeWS()
-    return manager, s
+    call = InboundCall(manager, "c1", _record())
+    call.ws = FakeWS()
+    return manager, call
 
 
-def test_tool_definitions_flat_format(settings):
-    tools = tool_definitions(settings)
-    names = {t["name"] for t in tools}
-    assert {"end_call", "get_current_time", "transfer_call"} <= names
-    assert all(t["type"] == "function" and "parameters" in t for t in tools)
+async def _drain(manager):
+    for _ in range(5):
+        await asyncio.sleep(0)
+        if manager._tasks:
+            await asyncio.wait(list(manager._tasks), timeout=0.2)
+
+
+@pytest.fixture(autouse=True)
+def fast(monkeypatch):
+    monkeypatch.setattr(calls, "BACKSTOP_SECONDS", 5.0)
+    monkeypatch.setattr(InboundCall, "tail_seconds", 0.01)
+    monkeypatch.setattr(OutboundCall, "tail_seconds", 0.01)
 
 
 async def test_transcripts_recorded(settings):
-    _, s = _session(settings)
-    await s.handle(
+    _, call = _inbound(settings)
+    await call.on_event(
         {"type": "conversation.item.input_audio_transcription.completed", "transcript": "hi"}
     )
-    await s.handle({"type": "response.output_audio_transcript.done", "transcript": "hello"})
-    assert s.record["transcript"] == [
+    await call.on_event({"type": "response.output_audio_transcript.done", "transcript": "hello"})
+    assert call.record["transcript"] == [
         {"role": "caller", "text": "hi"},
         {"role": "agent", "text": "hello"},
     ]
 
 
-async def test_tool_call_returns_output_then_response(settings):
-    manager, s = _session(settings)
-    await s.handle(
-        {
-            "type": "response.function_call_arguments.done",
-            "call_id": "fc1",
-            "name": "get_current_time",
-            "arguments": "{}",
-        }
+async def test_end_call_replies_then_hangs_up_once_after_goodbye(settings):
+    manager, call = _inbound(settings)
+    await call.on_event(
+        {"type": "response.function_call_arguments.done", "call_id": "fc1", "name": "end_call"}
     )
-    await asyncio.gather(*manager._tasks)
-    kinds = [m["type"] for m in s._ws.sent]
+    kinds = [m["type"] for m in call.ws.sent]
     assert kinds == ["conversation.item.create", "response.create"]
-    item = s._ws.sent[0]["item"]
-    assert item["type"] == "function_call_output" and item["call_id"] == "fc1"
-    assert "now" in json.loads(item["output"])
+    assert json.loads(call.ws.sent[0]["item"]["output"]) == {"status": "hanging up"}
+    # A response.done from before the goodbye must not hang up yet.
+    await call.on_event({"type": "response.done"})
+    await _drain(manager)
+    assert manager.xai.hangups == []
+    await call.on_event({"type": "response.created"})
+    await call.on_event({"type": "response.done"})
+    await call.on_event({"type": "response.done"})
+    await _drain(manager)
+    assert manager.xai.hangups == ["c1"]
+    await call.hangup("api")
+    assert manager.xai.hangups == ["c1"]
+    assert call.record["end_reason"] == "end_call"
 
 
-async def test_transfer_uses_configured_target(settings, monkeypatch):
-    manager, s = _session(settings)
-    monkeypatch.setattr(asyncio, "sleep", _nosleep)
-    await s.handle(
-        {
-            "type": "response.function_call_arguments.done",
-            "call_id": "fc2",
-            "name": "transfer_call",
-            "arguments": json.dumps({"target": "desk"}),
-        }
+async def test_backstop_hangs_up_if_goodbye_never_finishes(settings, monkeypatch):
+    monkeypatch.setattr(calls, "BACKSTOP_SECONDS", 0.01)
+    manager, call = _inbound(settings)
+    call.arm("end_call")
+    await _drain(manager)
+    assert manager.xai.hangups == ["c1"]
+
+
+async def test_idle_timeout_says_goodbye_and_arms(settings, monkeypatch):
+    manager, call = _inbound(settings)
+    call.last_activity -= settings.idle_seconds + 1
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(calls.asyncio, "sleep", lambda _d: real_sleep(0))
+    task = asyncio.create_task(call.watchdog())
+    await real_sleep(0.01)
+    call._hung_up = True
+    await asyncio.wait([task], timeout=1)
+    assert call.armed and call.record["end_reason"] == "idle"
+    assert call.ws.sent[0]["type"] == "response.create"
+
+
+async def test_unknown_tool_gets_error(settings):
+    _, call = _inbound(settings)
+    await call.on_event(
+        {"type": "response.function_call_arguments.done", "call_id": "f", "name": "x"}
     )
-    for _ in range(3):
-        await asyncio.gather(*list(manager._tasks))
-    assert manager.xai.refers == [("c1", "tel:+16045550111")]
+    assert "error" in json.loads(call.ws.sent[0]["item"]["output"])
+    assert not call.armed
 
 
-async def test_unknown_tool_without_forwarder(settings):
-    manager, s = _session(settings)
-    await s.handle(
-        {
-            "type": "response.function_call_arguments.done",
-            "call_id": "fc3",
-            "name": "book_table",
-            "arguments": "{}",
-        }
+async def test_outbound_end_call_hangs_up_sip_leg(settings):
+    manager = CallManager(settings, xai=FakeXai())
+    call = OutboundCall(manager, "out_1", _record(), "+16045550111", "", "Hi")
+    call.ws = FakeWS()
+    call.sip = FakeSip()
+    await call.on_event(
+        {"type": "response.function_call_arguments.done", "call_id": "f", "name": "end_call"}
     )
-    await asyncio.gather(*manager._tasks)
-    assert "error" in json.loads(s._ws.sent[0]["item"]["output"])
-
-
-async def test_end_call_hangs_up_after_response(settings, monkeypatch):
-    manager, s = _session(settings)
-    monkeypatch.setattr(asyncio, "sleep", _nosleep)
-    await s.handle(
-        {
-            "type": "response.function_call_arguments.done",
-            "call_id": "fc4",
-            "name": "end_call",
-            "arguments": "{}",
-        }
-    )
-    await s.handle({"type": "response.done"})
-    for _ in range(3):
-        await asyncio.gather(*list(manager._tasks))
-    assert "c1" in manager.xai.hangups
-
-
-_real_sleep = asyncio.sleep
-
-
-async def _nosleep(_delay):
-    await _real_sleep(0)
+    await call.on_event({"type": "response.created"})
+    await call.on_event({"type": "response.done"})
+    await _drain(manager)
+    assert call.sip.commands == ["hangup"]
+    assert manager.xai.hangups == []

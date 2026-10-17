@@ -56,62 +56,47 @@ def create_app(settings: Settings | None = None, manager: CallManager | None = N
         log.info("ignored webhook type %s", etype[:64])
         return JSONResponse({"ignored": etype[:64]})
 
-    def _auth(request: Request) -> JSONResponse | None:
+    def _denied(request: Request) -> JSONResponse | None:
         if not _bearer_ok(request, settings.api_token):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return None
 
+    async def place_call(request: Request) -> JSONResponse:
+        if denied := _denied(request):
+            return denied
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        call_id, detail = manager.place(
+            str(payload.get("number", "")),
+            str(payload.get("briefing", "")),
+            str(payload.get("opening", "")),
+        )
+        if call_id is None:
+            return JSONResponse({"error": detail}, status_code=400)
+        return JSONResponse({"call_id": call_id, "status": detail}, status_code=202)
+
     async def list_calls(request: Request) -> JSONResponse:
-        if denied := _auth(request):
+        if denied := _denied(request):
             return denied
         return JSONResponse({"calls": list(manager.recent)})
 
     async def hangup(request: Request) -> JSONResponse:
-        if denied := _auth(request):
+        if denied := _denied(request):
             return denied
-        call_id = request.path_params["call_id"]
-        if call_id not in manager.active:
+        call = manager.active.get(request.path_params["call_id"])
+        if call is None:
             return JSONResponse({"error": "no such active call"}, status_code=404)
-        manager.spawn(manager.active[call_id].hangup("api"))
+        manager.spawn(call.hangup("api"))
         return JSONResponse({"ok": True}, status_code=202)
-
-    async def transfer(request: Request) -> JSONResponse:
-        """Dial out from an active call (xAI SIP REFER). Target must be configured."""
-        if denied := _auth(request):
-            return denied
-        call_id = request.path_params["call_id"]
-        session = manager.active.get(call_id)
-        if session is None:
-            return JSONResponse({"error": "no such active call"}, status_code=404)
-        try:
-            payload = await request.json()
-        except Exception:  # noqa: BLE001
-            payload = {}
-        uri = settings.transfer_targets.get(str(payload.get("target", "")).lower())
-        if not uri:
-            return JSONResponse({"error": "unknown target"}, status_code=400)
-        session.start_transfer(uri)
-        return JSONResponse({"ok": True}, status_code=202)
-
-    async def outbound(request: Request) -> JSONResponse:
-        if denied := _auth(request):
-            return denied
-        return JSONResponse(
-            {
-                "error": "not_supported",
-                "detail": "xAI's API has no call-origination endpoint yet. Inbound calls work; "
-                "dial-out works mid-call via /calls/{id}/transfer (SIP REFER).",
-            },
-            status_code=501,
-        )
 
     return Starlette(
         routes=[
             Route("/healthz", health),
             Route("/xai/webhook", xai_webhook, methods=["POST"]),
+            Route("/call", place_call, methods=["POST"]),
             Route("/calls", list_calls),
-            Route("/calls/outbound", outbound, methods=["POST"]),
             Route("/calls/{call_id}/hangup", hangup, methods=["POST"]),
-            Route("/calls/{call_id}/transfer", transfer, methods=["POST"]),
         ]
     )

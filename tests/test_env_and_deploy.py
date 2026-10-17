@@ -15,12 +15,6 @@ def test_set_value_replaces_and_keeps_0600(tmp_path):
     assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
 
 
-def test_service_binds_nothing_public_and_has_no_audio():
-    unit = (ROOT / "deploy/ringabot.service").read_text()
-    assert "snd-aloop" not in unit and "audio" not in unit.lower().split("description")[0]
-    assert "MemoryMax=" in unit
-
-
-def test_no_baresip_left():
-    for path in (ROOT / "src").rglob("*.py"):
-        assert "baresip" not in path.read_text().lower()
+def test_caddy_exposes_only_webhook_and_health():
+    caddy = (ROOT / "deploy/Caddyfile").read_text()
+    assert "/xai/webhook /healthz" in caddy and "/calls" not in caddy.split("@app")[1]
