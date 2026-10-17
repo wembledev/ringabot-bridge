@@ -226,3 +226,11 @@ def test_outbound_persona_says_wait_for_hello(settings):
     inbound = session_config(settings, inbound=True)["session"]["instructions"]
     assert "Let them speak first" in outbound and DISCLOSURE in outbound
     assert "Let them speak first" not in inbound
+
+
+def test_every_call_opens_with_hello_then_disclosure(settings):
+    from ringabot.calls import DISCLOSURE, opening_event, opening_line
+
+    assert opening_line(settings).startswith(f"Hello! {DISCLOSURE}")
+    inbound = opening_event(settings, inbound=True)["response"]["instructions"]
+    assert opening_line(settings) in inbound

@@ -65,8 +65,13 @@ def instructions_for(settings, briefing: str = "", inbound: bool = False) -> str
     )
 
 
+def opening_line(settings) -> str:
+    """What the agent says first on every call: hello, the AI disclosure, the greeting."""
+    return f"Hello! {DISCLOSURE} {settings.greeting}".strip()
+
+
 def _wait_line(settings) -> str:
-    line = f"{DISCLOSURE} {settings.greeting}".strip()
+    line = opening_line(settings)
     return (
         f'You placed this call. Let them speak first, then begin your first reply with: "{line}"\n'
     )
@@ -92,7 +97,7 @@ def session_config(settings, briefing: str = "", inbound: bool = False) -> dict:
 def opening_event(settings, briefing: str = "", inbound: bool = False) -> dict:
     """First turn on every call: a normal response, so xAI's turn detection can interrupt
     it like any other. Per-response instructions replace the session ones, so repeat them."""
-    line = f"{DISCLOSURE} {settings.greeting}".strip()
+    line = opening_line(settings)
     instructions = instructions_for(settings, briefing, inbound)
     return {
         "type": "response.create",
