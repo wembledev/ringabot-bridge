@@ -71,7 +71,6 @@ def create_app(settings: Settings | None = None, manager: CallManager | None = N
         call_id, detail = manager.place(
             str(payload.get("number", "")),
             str(payload.get("briefing", "")),
-            str(payload.get("opening", "")),
         )
         if call_id is None:
             return JSONResponse({"error": detail}, status_code=400)

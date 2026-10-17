@@ -43,6 +43,32 @@ EMERGENCY = {"911", "112", "999", "000", "988", "110", "119"}
 BACKSTOP_SECONDS = 10.0
 
 
+def session_config(settings, briefing: str = "", audio: dict | None = None) -> dict:
+    """One persona for both directions. Outbound only adds its briefing (and PCM format)."""
+    instructions = settings.instructions
+    if briefing:
+        instructions += f"\n\nYou placed this call. Briefing: {briefing}"
+    session = {
+        "voice": settings.voice,
+        "instructions": instructions,
+        "turn_detection": {"type": "server_vad"},
+        "tools": [END_CALL_TOOL],
+    }
+    if audio:
+        session["audio"] = audio
+    return {"type": "session.update", "session": session}
+
+
+def greeting_event(settings, briefing: str = "") -> dict:
+    """First turn, same for inbound and outbound (per-response instructions replace the
+    session ones, so repeat them)."""
+    instructions = session_config(settings, briefing)["session"]["instructions"]
+    return {
+        "type": "response.create",
+        "response": {"instructions": f"{instructions}\n\n{settings.greeting}"},
+    }
+
+
 def _header(sip_headers: list, name: str) -> str:
     for h in sip_headers or []:
         if isinstance(h, dict) and str(h.get("name", "")).lower() == name.lower():
@@ -195,23 +221,8 @@ class InboundCall(Call):
         try:
             async with websockets.connect(url, additional_headers=headers, open_timeout=10) as ws:
                 self.ws = ws
-                await self.send(
-                    {
-                        "type": "session.update",
-                        "session": {
-                            "voice": s.voice,
-                            "instructions": s.instructions,
-                            "turn_detection": {"type": "server_vad"},
-                            "tools": [END_CALL_TOOL],
-                        },
-                    }
-                )
-                await self.send(
-                    {
-                        "type": "response.create",
-                        "response": {"instructions": f"{s.instructions}\n\n{s.greeting}"},
-                    }
-                )
+                await self.send(session_config(s))
+                await self.send(greeting_event(s))
                 self.record["status"] = "in_progress"
                 dog = self.manager.spawn(self.watchdog())
                 try:
@@ -233,11 +244,10 @@ class InboundCall(Call):
 class OutboundCall(Call):
     """baresip dials; PCM is relayed between snd-aloop and the realtime websocket."""
 
-    def __init__(self, manager, call_id, record, number: str, briefing: str, opening: str):
+    def __init__(self, manager, call_id, record, number: str, briefing: str):
         super().__init__(manager, call_id, record)
         self.number = number
         self.briefing = briefing
-        self.opening = opening
         self.sip: SipClient | None = None
         self.audio: AlsaLoop | None = None
 
@@ -273,25 +283,11 @@ class OutboundCall(Call):
             ) as ws:
                 self.ws = ws
                 fmt = {"type": "audio/pcm", "rate": SAMPLE_RATE}
-                asr = {"model": "grok-transcribe"}
-                instructions = s.instructions
-                if self.briefing:
-                    instructions += f"\n\nYou placed this call. Briefing: {self.briefing}"
-                await self.send(
-                    {
-                        "type": "session.update",
-                        "session": {
-                            "voice": s.voice,
-                            "instructions": instructions,
-                            "turn_detection": {"type": "server_vad"},
-                            "tools": [END_CALL_TOOL],
-                            "audio": {
-                                "input": {"format": fmt, "transcription": asr},
-                                "output": {"format": fmt},
-                            },
-                        },
-                    }
-                )  # fmt: skip
+                audio = {
+                    "input": {"format": fmt, "transcription": {"model": "grok-transcribe"}},
+                    "output": {"format": fmt},
+                }
+                await self.send(session_config(s, self.briefing, audio))
                 self.record["status"] = "dialing"
                 await self.sip.command(f"dial {dial_uri(self.number, s.sip_server)}")
                 ev = await self.sip.wait_type("CALL_ESTABLISHED", "CALL_CLOSED", timeout=60)
@@ -301,18 +297,7 @@ class OutboundCall(Call):
                     return
                 self.record["status"] = "in_progress"
                 self.started = self.last_activity = time.monotonic()
-                await self.send(
-                    {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "force_message",
-                            "role": "assistant",
-                            "interruptible": False,
-                            "content": [{"type": "output_text", "text": self.opening}],
-                        },
-                    }
-                )
-                self.record["transcript"].append({"role": "agent", "text": self.opening})
+                await self.send(greeting_event(s, self.briefing))
                 await self._relay(ws)
         except Exception as exc:  # noqa: BLE001
             self.record["error"] = self.record.get("error") or type(exc).__name__
@@ -413,7 +398,7 @@ class CallManager:
         self._start(InboundCall(self, call_id, record))
         return True, "accepted"
 
-    def place(self, number: str, briefing: str = "", opening: str = "") -> tuple[str | None, str]:
+    def place(self, number: str, briefing: str = "") -> tuple[str | None, str]:
         s = self.settings
         if not s.outbound_ready:
             return None, "outbound not configured"
@@ -427,7 +412,6 @@ class CallManager:
             return None, "busy"
         call_id = "out_" + uuid.uuid4().hex[:16]
         record = self._record(call_id, "outbound", e164(s.did), target)
-        opening = opening or "Hi, I'm an AI assistant, not a human."
-        self._start(OutboundCall(self, call_id, record, target, briefing[:2000], opening[:300]))
+        self._start(OutboundCall(self, call_id, record, target, briefing[:2000]))
         log.info("call %s outbound dialing", call_id)
         return call_id, "dialing"

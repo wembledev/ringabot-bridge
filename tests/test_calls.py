@@ -116,7 +116,7 @@ async def test_unknown_tool_gets_error(settings):
 
 async def test_outbound_end_call_hangs_up_sip_leg(settings):
     manager = CallManager(settings, xai=FakeXai())
-    call = OutboundCall(manager, "out_1", _record(), "+16045550111", "", "Hi")
+    call = OutboundCall(manager, "out_1", _record(), "+16045550111", "")
     call.ws = FakeWS()
     call.sip = FakeSip()
     await call.on_event(
@@ -127,3 +127,15 @@ async def test_outbound_end_call_hangs_up_sip_leg(settings):
     await _drain(manager)
     assert call.sip.commands == ["hangup"]
     assert manager.xai.hangups == []
+
+
+def test_inbound_and_outbound_share_persona(settings):
+    from ringabot.calls import greeting_event, session_config
+
+    inbound = session_config(settings)["session"]
+    outbound = session_config(settings, "Ask about lunch", {"input": {}})["session"]
+    for key in ("voice", "turn_detection", "tools"):
+        assert inbound[key] == outbound[key]
+    assert outbound["instructions"].startswith(inbound["instructions"])
+    assert "Ask about lunch" in outbound["instructions"]
+    assert settings.greeting in greeting_event(settings, "x")["response"]["instructions"]

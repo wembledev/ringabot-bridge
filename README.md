@@ -6,6 +6,8 @@ Small phone line for a Grok voice agent on a 1 GB VM. You bring your own carrier
 - **Inbound:** the carrier routes the DID straight to xAI Direct SIP. xAI POSTs a signed
   `realtime.call.incoming` webhook; we answer it in milliseconds, then join the call with
   `wss://api.x.ai/v1/realtime?call_id=...` in a background task. No audio touches this host.
+- **One persona:** inbound and outbound share the same voice, instructions, greeting and
+  tools (`session_config`); outbound only adds the caller's briefing.
 - **Outbound:** `POST /call` starts one baresip process that dials through the carrier
   sub-account; 8 kHz PCM is relayed between snd-aloop and the xAI realtime websocket.
 - **Hang-up:** the agent says goodbye, then calls `end_call`. We answer "hanging up", let
@@ -82,7 +84,7 @@ ID and fails immediately.
 | --- | --- | --- |
 | `POST /xai/webhook` | xAI signature | Incoming-call events (public via Caddy) |
 | `GET /healthz` | none | Liveness and active call count (public via Caddy) |
-| `POST /call` | bearer | `{"number","briefing","opening"}`: place one outbound call |
+| `POST /call` | bearer | `{"number","briefing"}`: place one outbound call (same persona as inbound plus the briefing) |
 | `GET /calls` | bearer | Recent calls with transcripts |
 | `POST /calls/{id}/hangup` | bearer | End a call |
 
