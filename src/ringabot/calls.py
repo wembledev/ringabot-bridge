@@ -48,7 +48,6 @@ BYTES_PER_SECOND = 16000
 
 
 DISCLOSURE = "I am an AI assistant, not a human. I cannot contact emergency services."
-DEFAULT_GREETING = "Hi, this is an AI assistant."
 SAMPLE_FORMAT = {"type": "audio/pcm", "rate": SAMPLE_RATE}
 REALTIME_URL = "wss://api.x.ai/v1/realtime"
 WORK_DIR = Path("/run/ringabot")
@@ -74,7 +73,7 @@ def instructions_for(settings, briefing: str = "", inbound: bool = False) -> str
 
 def opening_line(settings) -> str:
     """What the agent says first on every call. Keep it short; it must say it is an AI."""
-    return settings.greeting or DEFAULT_GREETING
+    return settings.greeting or f"Hi, this is {settings.persona_name}, an AI assistant."
 
 
 def _first_line(settings, inbound: bool) -> str:

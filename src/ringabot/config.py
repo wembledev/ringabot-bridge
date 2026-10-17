@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass, field
 
 # Persona from the Oct 16 outbound test call (the one that sounded best).
-DEFAULT_PERSONA_NAME = "Assistant"
+DEFAULT_PERSONA_NAME = "Ringabot"
 DEFAULT_VOICE = "aurora"
 DEFAULT_NOTES = "Be brief and polite."
 

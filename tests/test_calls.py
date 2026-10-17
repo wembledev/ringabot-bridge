@@ -243,9 +243,10 @@ def test_outbound_persona_says_wait_for_hello(settings):
 def test_every_call_opens_with_the_short_greeting(settings):
     from dataclasses import replace
 
-    from ringabot.calls import DEFAULT_GREETING, opening_line, session_config
+    from ringabot.calls import opening_line, session_config
 
-    assert opening_line(replace(settings, greeting="")) == DEFAULT_GREETING
+    plain = replace(settings, greeting="", persona_name="Ringabot")
+    assert opening_line(plain) == "Hi, this is Ringabot, an AI assistant."
     custom = replace(settings, greeting="Hi, this is the test line's AI assistant.")
     assert opening_line(custom) == "Hi, this is the test line's AI assistant."
     for inbound in (True, False):

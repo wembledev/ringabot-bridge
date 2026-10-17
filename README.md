@@ -8,7 +8,7 @@ Small phone line for a Grok voice agent on a 1 GB VM. You bring your own carrier
   `wss://api.x.ai/v1/realtime?call_id=...` in a background task. No audio touches this host.
 - **One persona:** the webhook server sets voice, instructions, opening line and tools for
   every call (`session_config`); outbound only adds a briefing. Every call
-  opens with a short greeting (`GREETING`, e.g. "Hi, this is an AI assistant.") as a normal
+  opens with a short greeting (default "Hi, this is Ringabot, an AI assistant.") as a normal
   response that xAI can interrupt like any other turn; the full AI and emergency rules stay
   in the instructions. Inbound
   answers first; outbound waits for the callee's hello (greets anyway after 4 s).
