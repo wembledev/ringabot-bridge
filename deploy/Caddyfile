@@ -1,8 +1,8 @@
-# Automatic TLS. Public: the xAI webhook, the health check and the MCP connector
-# (/mcp, bearer API_TOKEN). Admin routes (/call, /calls) stay on loopback: use them over SSH.
+# Automatic TLS. Public: the xAI webhook, health, MCP, signup, Stripe webhook,
+# and the two Checkout return pages. Admin routes (/call, /calls) stay on loopback.
 # Example PUBLIC_HOSTNAME: 203-0-113-7.sslip.io
 {$PUBLIC_HOSTNAME} {
-	@app path /xai/webhook /healthz /mcp
+	@app path /xai/webhook /healthz /mcp /signup /stripe/webhook /billing/success /billing/cancel
 	handle @app {
 		request_body {
 			max_size 64KB

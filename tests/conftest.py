@@ -17,17 +17,21 @@ class FakeXai:
 
 
 @pytest.fixture
-def settings():
+def settings(tmp_path):
     return Settings.from_env(
         {
             "XAI_API_KEY": "test-key-placeholder",
             "XAI_WEBHOOK_SECRET": SECRET,
             "API_TOKEN": "admin-placeholder",
             "DID": "6045550100",
+            "PUBLIC_URL": "https://ringabot.example",
             "SIP_SERVER": "pop.example.net",
             "SIP_USERNAME": "100000_test",
             "SIP_PASSWORD": "sip-placeholder",
             "ALLOWED_DESTINATIONS": "+16045550111",
             "IDLE_TIMEOUT": "30",
+            "STRIPE_SECRET_KEY": "sk_test_placeholder",
+            "STRIPE_WEBHOOK_SECRET": "whsec_test_placeholder",
+            "RINGABOT_DB": str(tmp_path / "ringabot.sqlite"),
         }
     )

@@ -27,8 +27,8 @@ def _rpc(client, method, params=None, rid=1, headers=AUTH):
     return client.post("/mcp", json=msg, headers=headers)
 
 
-def _tool(client, name, args):
-    r = _rpc(client, "tools/call", {"name": name, "arguments": args})
+def _tool(client, name, args, headers=AUTH):
+    r = _rpc(client, "tools/call", {"name": name, "arguments": args}, headers=headers)
     assert r.status_code == 200
     result = r.json()["result"]
     return result["isError"], json.loads(result["content"][0]["text"])
@@ -57,7 +57,7 @@ def test_initialize_and_list(settings):
     note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
     assert client.post("/mcp", json=note, headers=AUTH).status_code == 202
     names = [t["name"] for t in _rpc(client, "tools/list").json()["result"]["tools"]]
-    assert names == ["place_call", "list_calls", "hang_up"]
+    assert names == ["place_call", "list_calls", "hang_up", "get_number"]
     assert _rpc(client, "nope").json()["error"]["code"] == -32601
     assert _rpc(client, "tools/list", [1]).json()["error"]["code"] == -32602
     reply = {"jsonrpc": "2.0", "id": 9, "result": {}}

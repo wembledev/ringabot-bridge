@@ -1,6 +1,6 @@
 """Minimal MCP server (Streamable HTTP, stateless, JSON responses) at POST /mcp.
 
-Three tools wrap the existing CallManager: place_call, list_calls, hang_up.
+Tools: place_call, list_calls, hang_up, get_number.
 No sessions, no SSE, no extra dependency.
 """
 
@@ -12,6 +12,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from ringabot import __version__
+from ringabot.billing import BillingError
+from ringabot.store import Account, Admin
 
 VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MAX_BODY = 64 * 1024
@@ -53,6 +55,22 @@ TOOLS = [
             "required": ["call_id"],
         },
     },
+    {
+        "name": "get_number",
+        "description": (
+            "Start a monthly phone-number subscription and return a Stripe Checkout URL. "
+            "The user opens that URL once to approve the charge. currency is usd or cad. "
+            "area_code is optional and is kept for when the number is provisioned."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "currency": {"type": "string", "enum": ["usd", "cad"]},
+                "area_code": {"type": "string", "description": "Optional area code, digits only."},
+            },
+            "required": ["currency"],
+        },
+    },
 ]
 
 
@@ -69,13 +87,37 @@ def _text(data, is_error: bool = False) -> dict:
     return {"content": [{"type": "text", "text": json.dumps(data)}], "isError": is_error}
 
 
-def _call_tool(manager, name: str, args: dict) -> dict:
+def _needs_number(store, who) -> dict | None:
+    if isinstance(who, Account) and not store.has_active(who.id):
+        return _text({"error": "no active number"}, True)
+    return None
+
+
+def _call_tool(manager, store, billing, who, name: str, args: dict) -> dict:
+    if name == "get_number":
+        if not isinstance(who, Account):
+            return _text({"error": "get_number needs an account token from POST /signup"}, True)
+        try:
+            return _text(
+                billing.checkout(who, str(args.get("currency", "")), str(args.get("area_code", "")))
+            )
+        except BillingError as exc:
+            return _text({"error": str(exc)}, True)
     if name == "place_call":
-        call_id, detail = manager.place(str(args.get("number", "")), str(args.get("briefing", "")))
+        if blocked := _needs_number(store, who):
+            return blocked
+        account_id = who.id if isinstance(who, Account) else None
+        call_id, detail = manager.place(
+            str(args.get("number", "")),
+            str(args.get("briefing", "")),
+            account_id=account_id,
+        )
         if call_id is None:
             return _text({"error": detail}, True)
         return _text({"call_id": call_id, "status": detail})
     if name == "list_calls":
+        if blocked := _needs_number(store, who):
+            return blocked
         try:
             limit = max(1, min(20, int(args.get("limit", 10))))
         except (TypeError, ValueError):
@@ -85,20 +127,22 @@ def _call_tool(manager, name: str, args: dict) -> dict:
             {k: r.get(k) for k in keep if k in r}
             for r in manager.recent
             if r.get("direction") == "outbound"
+            and (isinstance(who, Admin) or r.get("account_id") == who.id)
         ]
         return _text({"calls": calls[:limit]})
     if name == "hang_up":
         call = manager.active.get(str(args.get("call_id", "")))
-        if call is None:
+        if call is None or (isinstance(who, Account) and call.record.get("account_id") != who.id):
             return _text({"error": "no such active call"}, True)
         manager.spawn(call.hangup("mcp"))
         return _text({"ok": True})
     raise KeyError(name)
 
 
-def make_endpoint(manager, authorized):
+def make_endpoint(manager, identify, store, billing):
     async def mcp(request: Request) -> Response:
-        if not authorized(request):
+        who = identify(request)
+        if who is None:
             return JSONResponse(
                 {"error": "unauthorized"},
                 status_code=401,
@@ -138,7 +182,10 @@ def make_endpoint(manager, authorized):
             if not isinstance(args, dict):
                 return _err(rid, -32602, "arguments must be an object")
             try:
-                return _ok(rid, _call_tool(manager, str(params.get("name", "")), args))
+                result = _call_tool(
+                    manager, store, billing, who, str(params.get("name", "")), args
+                )
+                return _ok(rid, result)
             except KeyError:
                 return _err(rid, -32602, "unknown tool")
         return _err(rid, -32601, "method not found")

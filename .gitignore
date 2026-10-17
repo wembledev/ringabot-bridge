@@ -8,6 +8,10 @@ __pycache__/
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 /data/
 /var/
 *.wav
