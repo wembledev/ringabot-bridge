@@ -30,14 +30,29 @@ class AlsaLoop:
     async def start(self) -> None:
         if shutil.which("arecord") is None or shutil.which("aplay") is None:
             raise AudioUnavailable("alsa-utils is not installed")
-        common = ["-D", self._device, "-f", "S16_LE", "-r", str(SAMPLE_RATE), "-c", "1",
-                  "-t", "raw", "--period-time=20000", "--buffer-time=80000"]  # fmt: skip
         self._capture = await asyncio.create_subprocess_exec(
-            "arecord", *common, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-        )
+            "arecord", *self._args(), stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )  # fmt: skip
+        await self._start_playback()
+
+    def _args(self) -> list[str]:
+        return ["-D", self._device, "-f", "S16_LE", "-r", str(SAMPLE_RATE), "-c", "1",
+                "-t", "raw", "--period-time=20000", "--buffer-time=80000"]  # fmt: skip
+
+    async def _start_playback(self) -> None:
         self._playback = await asyncio.create_subprocess_exec(
-            "aplay", *common, stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-        )
+            "aplay", *self._args(), stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )  # fmt: skip
+
+    async def flush(self) -> None:
+        """Drop queued speech (barge-in): restart aplay so its pipe buffer is discarded."""
+        old, self._playback = self._playback, None
+        if old is not None and old.returncode is None:
+            old.kill()
+            await old.wait()
+        await self._start_playback()
 
     async def read(self) -> bytes | None:
         if self._capture is None or self._capture.stdout is None:

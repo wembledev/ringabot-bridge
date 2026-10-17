@@ -120,7 +120,12 @@ class Call:
         self.record = record
         self.ws = None
         self.armed = False
+        self._need_new_response = False  # idle/max goodbye: wait for the response we ask for
         self._goodbye_started = False
+        self._tail_spawned = False
+        self._response_started = time.monotonic()
+        self.play_until = 0.0  # monotonic time the agent's queued speech should end
+        self._items: dict[str, dict] = {}
         self._hung_up = False
         self.last_activity = time.monotonic()
         self.started = time.monotonic()
@@ -151,12 +156,14 @@ class Call:
         await self.hangup(self.record.get("end_reason") or "backstop")
 
     async def _after_tail(self) -> None:
-        await asyncio.sleep(self.tail_seconds)
+        """Wait until the goodbye has played out, then a short tail (voice-agent pattern)."""
+        await asyncio.sleep(max(0.0, self.play_until - time.monotonic()) + self.tail_seconds)
         await self.hangup(self.record.get("end_reason") or "end_call")
 
     async def say_goodbye(self, reason: str) -> None:
         if self.armed:
             return
+        self._need_new_response = True
         self.arm(reason)
         await self.send(
             {
@@ -181,30 +188,64 @@ class Call:
             with contextlib.suppress(websockets.ConnectionClosed):
                 await self.ws.send(json.dumps(event))
 
+    def _transcript(self, role: str, event: dict) -> None:
+        """Store final lines only, one per conversation item (xAI can repeat events)."""
+        text = (event.get("transcript") or "").strip()
+        if not text:
+            return
+        item_id = str(event.get("item_id") or "")
+        if item_id and item_id in self._items:
+            self._items[item_id]["text"] = text
+            return
+        lines = self.record["transcript"]
+        if not item_id and lines and lines[-1] == {"role": role, "text": text}:
+            return
+        entry = {"role": role, "text": text}
+        lines.append(entry)
+        if item_id:
+            self._items[item_id] = entry
+        del lines[:-200]
+
     async def on_event(self, event: dict) -> None:
         etype = event.get("type", "")
-        transcript = self.record["transcript"]
-        if etype in ("input_audio_buffer.speech_started", "response.output_audio.delta"):
-            self.last_activity = time.monotonic()
+        now = time.monotonic()
+        if etype == "input_audio_buffer.speech_started":
+            # xAI's server VAD owns turn-taking and cancels its own response.
+            self.last_activity = now
+            await self.on_interrupt()
+        elif etype == "response.output_audio.delta":
+            self.last_activity = now
         elif etype == "conversation.item.input_audio_transcription.completed":
-            self.last_activity = time.monotonic()
-            transcript.append({"role": "caller", "text": event.get("transcript", "")})
+            self.last_activity = now
+            self._transcript("caller", event)
         elif etype == "response.output_audio_transcript.done":
-            transcript.append({"role": "agent", "text": event.get("transcript", "")})
+            self._transcript("agent", event)
+            # Speech runs about 14 characters a second; xAI may still be playing it.
+            spoken = len(event.get("transcript") or "") / 14.0
+            self.play_until = max(self.play_until, self._response_started + spoken)
         elif etype == "response.function_call_arguments.done":
             await self._tool(event)
-        elif etype == "response.created" and self.armed:
-            self._goodbye_started = True
-        elif etype == "response.done" and self.armed and self._goodbye_started:
-            self.manager.spawn(self._after_tail())
+        elif etype == "response.created":
+            self._response_started = now
+            if self.armed:
+                self._goodbye_started = True
+        elif etype == "response.done" and self.armed and not self._tail_spawned:
+            if not self._need_new_response or self._goodbye_started:
+                self._tail_spawned = True
+                self.manager.spawn(self._after_tail())
         elif etype == "error":
             log.warning("call %s realtime error: %s", self.call_id, str(event.get("error"))[:200])
-        del transcript[:-200]
+
+    async def on_interrupt(self) -> None:
+        """Inbound: nothing to do, xAI plays the audio. Outbound overrides it."""
+        self.play_until = 0.0
 
     async def _tool(self, event: dict) -> None:
+        """end_call gets a bare {"ok": true} and no new response, so nothing more is said;
+        we hang up once the goodbye that came before it has played."""
         name = event.get("name", "")
         self.record["tools"].append(name)
-        output = {"status": "hanging up"} if name == "end_call" else {"error": "unknown tool"}
+        output = {"ok": True} if name == "end_call" else {"error": "unknown tool"}
         await self.send(
             {
                 "type": "conversation.item.create",
@@ -217,7 +258,8 @@ class Call:
         )
         if name == "end_call":
             self.arm("end_call")
-        await self.send({"type": "response.create"})
+        else:
+            await self.send({"type": "response.create"})
 
     def finish(self) -> None:
         self._hung_up = True
@@ -232,9 +274,9 @@ class Call:
 
 
 class InboundCall(Call):
-    """xAI owns the SIP leg and plays audio; we only see events, so wait a bit longer."""
+    """xAI owns the SIP leg and plays audio; we estimate playback from the transcript."""
 
-    tail_seconds = 2.0
+    tail_seconds = 1.5
 
     async def _hangup_leg(self) -> None:
         await self.manager.xai.hangup(self.call_id)
@@ -275,16 +317,32 @@ class OutboundCall(Call):
         self.briefing = briefing
         self.sip: SipClient | None = None
         self.audio: AlsaLoop | None = None
+        self._muted = False
 
     async def _hangup_leg(self) -> None:
         if self.sip is not None:
             await self.sip.command("hangup")
 
     async def on_event(self, event: dict) -> None:
-        if event.get("type") == "response.output_audio.delta" and self.audio is not None:
+        etype = event.get("type")
+        if etype == "response.created":
+            self._muted = False
+        elif etype == "response.output_audio.delta" and self.audio is not None and not self._muted:
             with contextlib.suppress(Exception):
-                await self.audio.write(base64.b64decode(event.get("delta") or ""))
+                pcm = base64.b64decode(event.get("delta") or "")
+                # 8 kHz s16 mono = 16000 bytes a second of queued speech.
+                self.play_until = max(self.play_until, time.monotonic()) + len(pcm) / 16000
+                await self.audio.write(pcm)
         await super().on_event(event)
+
+    async def on_interrupt(self) -> None:
+        """Caller started talking: xAI already cancels its response; we only drop the
+        speech we have queued for the phone and ignore late chunks of that response."""
+        self._muted = True
+        self.play_until = 0.0
+        if self.audio is not None:
+            with contextlib.suppress(Exception):
+                await self.audio.flush()
 
     async def run(self) -> None:
         s = self.settings

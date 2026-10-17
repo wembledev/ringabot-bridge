@@ -11,9 +11,12 @@ Small phone line for a Grok voice agent on a 1 GB VM. You bring your own carrier
   opens with "I am an AI assistant, not a human. I cannot contact emergency services."
 - **Outbound:** `POST /call` starts one baresip process that dials through the carrier
   sub-account; 8 kHz PCM is relayed between snd-aloop and the xAI realtime websocket.
-- **Hang-up:** the agent says goodbye, then calls `end_call`. We answer "hanging up", let
-  that last response finish, wait a short tail and send exactly one hang-up (xAI call
-  control for inbound, baresip for outbound). A 10 s backstop, an idle timeout and a max
+- **Hang-up:** the agent says goodbye, then calls `end_call`. We return a bare
+  `{"ok": true}` without asking for a new response (so nothing else is spoken), wait until
+  the goodbye has played plus a short tail, and send exactly one hang-up (xAI call
+  control for inbound, baresip for outbound).
+- **Turn-taking:** xAI's server VAD owns interruptions. On outbound we only drop the speech
+  we have queued for the phone when xAI reports `speech_started`. A 10 s backstop, an idle timeout and a max
   call length end anything that lingers.
 
 One process, no database, no queue. No credentials ship in this repo; `.env.example` is
