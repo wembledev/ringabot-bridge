@@ -13,6 +13,7 @@ from starlette.routing import Route
 
 from ringabot.calls import CallManager
 from ringabot.config import Settings
+from ringabot.mcp import make_endpoint
 from ringabot.signature import SignatureError, Verifier
 
 log = logging.getLogger("ringabot.app")
@@ -95,5 +96,10 @@ def create_app(settings: Settings | None = None, manager: CallManager | None = N
             Route("/call", place_call, methods=["POST"]),
             Route("/calls", list_calls),
             Route("/calls/{call_id}/hangup", hangup, methods=["POST"]),
+            Route(
+                "/mcp",
+                make_endpoint(manager, lambda r: _bearer_ok(r, settings.api_token)),
+                methods=["GET", "POST", "DELETE"],
+            ),
         ]
     )

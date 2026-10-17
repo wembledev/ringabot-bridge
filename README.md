@@ -35,6 +35,22 @@ caller ──PSTN──> carrier DID ──SIP/TLS──> sip:+1NXXNXXXXXX@sip.v
                                          xAI realtime session
 ```
 
+## Connect your Grok Bot (MCP)
+
+The server exposes a small MCP connector at `https://<PUBLIC_HOSTNAME>/mcp` (Streamable HTTP,
+stateless). Tools: `place_call(number, briefing)`, `list_calls(limit)`, `hang_up(call_id)`.
+It uses the same guards as `POST /call` (allow list, no emergency numbers, AI greeting).
+Auth is `Authorization: Bearer <API_TOKEN>`.
+
+```bash
+# Grok CLI
+grok mcp add --transport http ringabot https://<PUBLIC_HOSTNAME>/mcp \
+  --header "Authorization: Bearer ${RINGABOT_API_TOKEN}"
+```
+
+With the xAI API, pass the token as `authorization` on an `mcp` tool. Any MCP client that
+can send a bearer header works.
+
 ## Acceptable use
 
 Not a dialer for telemarketing or robocalls. Outbound calls only go to numbers matching
