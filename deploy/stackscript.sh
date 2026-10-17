@@ -6,7 +6,7 @@
 #
 # <UDF name="xai_api_key" label="xAI API key" />
 # <UDF name="voipms_sip_server" label="Voip.ms SIP server" example="your-pop.example.com" />
-# <UDF name="voipms_sip_user" label="Voip.ms SIP username" />
+# <UDF name="voipms_sip_user" label="Voip.ms sub-account username (not the DID)" />
 # <UDF name="voipms_sip_password" label="Voip.ms SIP password" />
 # <UDF name="voipms_did" label="Voip.ms caller ID (E.164)" example="+15555550100" />
 # <UDF name="persona_name" label="Persona name" example="Example Assistant" default="Example Assistant" />
@@ -43,7 +43,7 @@ require voipms_did "${voipms_did:-}"
 apt-get update
 apt-get install -y --no-install-recommends \
   baresip \
-  pulseaudio \
+  alsa-utils \
   python3 \
   ca-certificates \
   curl \
@@ -56,6 +56,9 @@ apt-get install -y --no-install-recommends \
 if ! id ringabot >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /var/lib/ringabot --shell /usr/sbin/nologin ringabot
 fi
+usermod -aG audio ringabot
+echo snd-aloop > /etc/modules-load.d/snd-aloop.conf
+modprobe snd-aloop || true
 install -d -o ringabot -g ringabot -m 0750 /var/lib/ringabot /opt/ringabot /etc/ringabot
 
 if [[ ! -x /usr/local/bin/uv ]]; then
@@ -101,16 +104,19 @@ export tools_webhook_secret="${tools_webhook_secret:-}"
 export public_hostname="${public_hostname:-}"
 export allowed_destinations="${allowed_destinations:-+1}"
 export api_token
-# Python, not a shell heredoc, so '$' inside a password is not expanded.
-python3 - <<'PY'
+# The project venv, not a shell heredoc, so '$' is not expanded and values
+# with spaces (PERSONA_NAME) stay quoted.
+/opt/ringabot/.venv/bin/python - <<'PY'
 import os
 from pathlib import Path
+
+from ringabot.envfile import quote_env
 
 def value(name: str) -> str:
     raw = os.environ.get(name, "")
     if "\n" in raw or "\r" in raw:
         raise SystemExit(f"refusing multiline value for {name}")
-    return raw
+    return quote_env(raw)
 
 lines = [
     f"XAI_API_KEY={value('xai_api_key')}",
@@ -118,6 +124,7 @@ lines = [
     "XAI_VOICE=aurora",
     f"VOIPMS_SIP_SERVER={value('voipms_sip_server')}",
     f"VOIPMS_SIP_USER={value('voipms_sip_user')}",
+    f"SIP_USERNAME={value('voipms_sip_user')}",
     f"VOIPMS_SIP_PASSWORD={value('voipms_sip_password')}",
     f"VOIPMS_DID={value('voipms_did')}",
     f"PERSONA_NAME={value('persona_name')}",
@@ -136,7 +143,7 @@ lines = [
     "HOST=127.0.0.1",
     "PORT=8787",
     "DATA_DIR=/var/lib/ringabot",
-    "AUDIO_MODE=pulse",
+    "AUDIO_MODE=alsa",
     "RINGABOT_MASTER_KEY_FILE=/etc/ringabot/master.key",
 ]
 path = Path("/etc/ringabot/ringabot.env")
@@ -159,6 +166,8 @@ ${public_hostname} {
 EOF
   systemctl enable caddy
   systemctl restart caddy
+  ufw allow 80/tcp
+  ufw allow 443/tcp
 else
   api_url="http://127.0.0.1:8787/mcp"
 fi
@@ -177,8 +186,6 @@ systemctl restart ringabot
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
 ufw --force enable
 
 dpkg-reconfigure -f noninteractive unattended-upgrades || true

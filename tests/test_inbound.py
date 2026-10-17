@@ -85,6 +85,26 @@ async def test_set_inbound_reports_status_and_rejects_bad_allow(app):
 
 
 @pytest.mark.asyncio
+async def test_pending_registration_does_not_restart_baresip(app, fakes, monkeypatch):
+    async def pending(_client, _timeout):
+        return "pending"
+
+    fakes[0].auto_register = False
+    monkeypatch.setattr("ringabot.inbound.confirm_registration", pending)
+    await _tool(app.state.client, "set_inbound", {"enabled": True})
+    async with asyncio.timeout(2):
+        while not app.state.inbound.waiting:
+            await asyncio.sleep(0.02)
+    await asyncio.sleep(0.6)
+    try:
+        registers = [item for item in fakes[0].commands if item == "register"]
+        assert registers == ["register"]
+        assert app.state.inbound.registered is False
+    finally:
+        await app.state.inbound.stop()
+
+
+@pytest.mark.asyncio
 async def test_inbound_call_lifecycle(app, fakes):
     client = app.state.client
     seen = []

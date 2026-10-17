@@ -4,7 +4,7 @@
 package_update: true
 packages:
   - baresip
-  - pulseaudio
+  - alsa-utils
   - python3
   - ca-certificates
   - curl
@@ -18,6 +18,7 @@ users:
     system: true
     home: /var/lib/ringabot
     shell: /usr/sbin/nologin
+    groups: [audio]
 write_files:
   - path: /etc/ringabot/ringabot.env
     owner: ringabot:ringabot
@@ -28,10 +29,11 @@ write_files:
       XAI_VOICE=aurora
       VOIPMS_SIP_SERVER=
       VOIPMS_SIP_USER=
+      SIP_USERNAME=
       VOIPMS_SIP_PASSWORD=
       VOIPMS_DID=
-      PERSONA_NAME=Example Assistant
-      PERSONA_INSTRUCTIONS=Be brief and polite.
+      PERSONA_NAME="Example Assistant"
+      PERSONA_INSTRUCTIONS="Be brief and polite."
       GREETING=
       TOOLS_WEBHOOK_URL=
       TOOLS_WEBHOOK_SECRET=
@@ -46,8 +48,12 @@ write_files:
       HOST=127.0.0.1
       PORT=8787
       DATA_DIR=/var/lib/ringabot
-      AUDIO_MODE=pulse
+      AUDIO_MODE=alsa
       RINGABOT_MASTER_KEY_FILE=/etc/ringabot/master.key
+  - path: /etc/modules-load.d/snd-aloop.conf
+    permissions: "0644"
+    content: |
+      snd-aloop
   - path: /etc/systemd/system/ringabot.service
     permissions: "0644"
     content: |
@@ -60,11 +66,12 @@ write_files:
       Type=simple
       User=ringabot
       Group=ringabot
+      SupplementaryGroups=audio
       EnvironmentFile=/etc/ringabot/ringabot.env
       Environment=XDG_RUNTIME_DIR=/run/ringabot
       RuntimeDirectory=ringabot
       WorkingDirectory=/opt/ringabot
-      ExecStartPre=/usr/bin/pulseaudio -D --exit-idle-time=-1
+      ExecStartPre=-+/sbin/modprobe snd-aloop
       ExecStart=/opt/ringabot/.venv/bin/ringabot serve
       Restart=on-failure
       RestartSec=2
@@ -95,11 +102,11 @@ c=pathlib.Path('/root/ringabot-credentials.txt'); c.write_text('API_URL=http://1
   - bash -c "if [ -n \"${RINGABOT_TARBALL_URL:-}\" ]; then test -n \"${RINGABOT_SHA256:-}\" && curl -fsSL \"$RINGABOT_TARBALL_URL\" -o /tmp/ringabot.tar.gz && echo \"$RINGABOT_SHA256  /tmp/ringabot.tar.gz\" | sha256sum -c - && tar -xzf /tmp/ringabot.tar.gz -C /opt/ringabot --strip-components=1; else git clone --depth 1 --branch \"${RINGABOT_REF:-main}\" \"${RINGABOT_GIT_URL:-https://github.com/wembledev/ringabot-bridge.git}\" /opt/ringabot; fi"
   - chown -R ringabot:ringabot /opt/ringabot
   - sudo -u ringabot -H uv sync --frozen --no-dev --project /opt/ringabot
+  - modprobe snd-aloop || true
   - ufw default deny incoming
   - ufw default allow outgoing
   - ufw allow 22/tcp
-  - ufw allow 80/tcp
-  - ufw allow 443/tcp
+  - bash -c 'host=$(sed -n "s/^PUBLIC_HOSTNAME=//p" /etc/ringabot/ringabot.env | tr -d "\""); if [ -n "$host" ]; then ufw allow 80/tcp; ufw allow 443/tcp; fi'
   - ufw --force enable
   - systemctl daemon-reload
   - systemctl enable --now ringabot

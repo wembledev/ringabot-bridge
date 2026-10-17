@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from ringabot.audio import MemoryAudio, PulseAudio
+from ringabot.audio import AlsaLoop, MemoryAudio, PulseAudio, baresip_pcm
 from ringabot.bridge import (
     VoiceClient,
     assistant_text,
@@ -24,7 +24,7 @@ from ringabot.limits import LimitError, normalize_destination
 from ringabot.persona import GOODBYE, opening_line, session_instructions, summary_prompt
 from ringabot.records import enforce_retention, parse_summary
 from ringabot.redact import REDACTOR
-from ringabot.sip import SipClient, dial_uri, start_baresip
+from ringabot.sip import SipClient, confirm_registration, dial_uri, start_baresip
 from ringabot.store import Store, utc_iso
 from ringabot.webhooks import WebhookClient
 
@@ -44,7 +44,7 @@ class CallService:
         self.webhooks = webhooks
         self.tasks: dict[str, asyncio.Task] = {}
         self.controls: dict[str, Control] = {}
-        self.audios: dict[str, MemoryAudio | PulseAudio] = {}
+        self.audios: dict[str, MemoryAudio | PulseAudio | AlsaLoop] = {}
         self._lock = asyncio.Lock()
         self._global = 0
         self._tenants: dict[str, int] = {}
@@ -198,7 +198,7 @@ class CallService:
         REDACTOR.add(self.settings.api_token)
         REDACTOR.add(self.settings.tools_webhook_secret)
         control = self.controls[call_id]
-        audio: MemoryAudio | PulseAudio | None = None
+        audio: MemoryAudio | PulseAudio | AlsaLoop | None = None
         voice: VoiceClient | None = None
         try:
             audio = self._new_audio(call_id, devices)
@@ -277,7 +277,7 @@ class CallService:
         REDACTOR.add(self.settings.api_token)
         REDACTOR.add(self.settings.tools_webhook_secret)
         control = self.controls[call_id]
-        audio: MemoryAudio | PulseAudio | None = None
+        audio: MemoryAudio | PulseAudio | AlsaLoop | None = None
         sip: SipClient | None = None
         voice: VoiceClient | None = None
         baresip = None
@@ -381,7 +381,7 @@ class CallService:
         self,
         call_id: str,
         tenant: str,
-        audio: MemoryAudio | PulseAudio,
+        audio: MemoryAudio | PulseAudio | AlsaLoop,
         sip: SipClient,
         voice: VoiceClient,
         control: Control,
@@ -489,7 +489,7 @@ class CallService:
         self,
         call_id: str,
         event: dict,
-        audio: MemoryAudio | PulseAudio,
+        audio: MemoryAudio | PulseAudio | AlsaLoop,
         voice: VoiceClient,
         deadline: float,
         idle_seconds: float,
@@ -601,9 +601,14 @@ class CallService:
 
     def _new_audio(
         self, call_id: str, devices: tuple[str, str] | None = None
-    ) -> MemoryAudio | PulseAudio:
+    ) -> MemoryAudio | PulseAudio | AlsaLoop:
         if self.settings.audio_mode == "memory":
             return MemoryAudio()
+        if self.settings.audio_mode == "alsa":
+            if devices is not None and devices[0].startswith("hw:Loopback,"):
+                substream = int(devices[0].rsplit(",", 1)[-1])
+                return AlsaLoop(call_id, substream=substream)
+            return AlsaLoop(call_id)
         if devices is None:
             return PulseAudio(call_id)
         return PulseAudio(
@@ -621,6 +626,7 @@ class CallService:
             client = SipClient(host, int(port))
             await client.connect()
             return client, None
+        driver = "pulse" if self.settings.audio_mode == "pulse" else "alsa"
         process = await start_baresip(
             work_root=self.settings.data_dir / "run",
             user=creds.sip_user,
@@ -630,6 +636,7 @@ class CallService:
             play_device=play,
             mic_device=mic,
             regint=0,
+            audio_driver=driver,
         )
         client = SipClient("127.0.0.1", process.port)
         await client.connect()
@@ -667,7 +674,9 @@ async def _wait_established(sip: SipClient, control: Control) -> dict:
     return {"type": "EOF"}
 
 
-def _devices(audio: MemoryAudio | PulseAudio, call_id: str) -> tuple[str, str]:
+def _devices(audio: MemoryAudio | PulseAudio | AlsaLoop, call_id: str) -> tuple[str, str]:
+    if isinstance(audio, AlsaLoop):
+        return audio.baresip_device, audio.baresip_device
     if isinstance(audio, PulseAudio):
         return audio.play_name, audio.mic_name
     safe = "".join(ch for ch in call_id if ch.isalnum())[:12]
@@ -717,22 +726,32 @@ async def probe_register(
             client = SipClient(host, int(port))
             await client.connect()
         else:
+            if settings.audio_mode == "pulse":
+                play, mic, driver = "probeplay", "probemic", "pulse"
+            else:
+                play = mic = baresip_pcm(7)
+                driver = "alsa"
             process = await start_baresip(
                 work_root=settings.data_dir / "run",
                 user=creds.sip_user,
                 password=creds.sip_password,
                 server=creds.sip_server,
                 did=creds.did,
-                play_device="probeplay",
-                mic_device="probemic",
+                play_device=play,
+                mic_device=mic,
                 regint=60,
+                audio_driver=driver,
             )
             client = SipClient("127.0.0.1", process.port)
             await client.connect()
         await client.command("register")
-        event = await client.wait_type("REGISTER_OK", "REGISTER_FAIL", timeout=timeout)
-        if event.get("type") == "REGISTER_OK":
+        status = await confirm_registration(client, timeout)
+        if status == "ok":
             return True, "registered"
+        if status == "pending":
+            return False, "register_pending"
+        if status == "closed":
+            return False, "register_closed"
         return False, "register_failed"
     except Exception as exc:
         code = str(exc).strip() or "register_failed"

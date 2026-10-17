@@ -42,7 +42,16 @@ def test_inbound_account_auto_answers(tmp_path: Path):
     text = (tmp_path / "cfg" / "accounts").read_text(encoding="utf-8")
     assert "answermode=auto" in text
     assert "regint=60" in text
-    assert "sip:15555550100@sip.example.com" in text
+    assert "<sip:example-user@sip.example.com>" in text
+    assert ' "+15555550100" ' in text or text.startswith('"+15555550100" ')
+    assert "sip:15555550100@" not in text
+    config = (tmp_path / "cfg" / "config").read_text(encoding="utf-8")
+    assert "sip_listen 0.0.0.0:0" in config
+    assert "module_path " in config
+    assert "module alsa.so" in config
+    assert "module menu.so" in config
+    assert "module pulse.so" not in config
+    assert "module stdio.so" not in config
     with pytest.raises(SipError):
         account_line(
             user="example-user",

@@ -45,7 +45,11 @@ def resolve_credentials(settings: Settings, store: Store, tenant: str) -> Creden
     )
     return Credentials(
         sip_server=store.get_setting(tenant, "voipms_sip_server") or settings.voipms_sip_server,
-        sip_user=store.get_setting(tenant, "voipms_sip_user") or settings.voipms_sip_user,
+        sip_user=(
+            store.get_setting(tenant, "voipms_sip_user")
+            or settings.sip_username
+            or settings.voipms_sip_user
+        ),
         sip_password=password,
         did=store.get_setting(tenant, "voipms_did") or settings.voipms_did,
         xai_api_key=api_key,

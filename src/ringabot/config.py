@@ -84,6 +84,7 @@ class Settings:
     xai_api_base: str
     voipms_sip_server: str
     voipms_sip_user: str
+    sip_username: str
     voipms_sip_password: str
     voipms_did: str
     persona_name: str
@@ -140,14 +141,25 @@ def master_key_from_env() -> bytes:
     raise SystemExit("set RINGABOT_MASTER_KEY or create the master key file")
 
 
+def resolve_audio_mode(raw: str) -> str:
+    """Empty defaults to alsa. pulse falls back when the 1.0.0 package has no pulse.so."""
+    mode = raw.lower() if raw else "alsa"
+    if mode not in {"pulse", "memory", "alsa"}:
+        raise SystemExit("AUDIO_MODE must be alsa, pulse, or memory")
+    if mode == "pulse":
+        from ringabot.sip import pulse_module_present
+
+        if not pulse_module_present():
+            return "alsa"
+    return mode
+
+
 def load_settings() -> Settings:
     destinations = _raw("ALLOWED_DESTINATIONS")
     prefixes = tuple(part.strip() for part in destinations.split(",") if part.strip())
     if not prefixes:
         prefixes = ("+1",)
-    audio_mode = (_raw("AUDIO_MODE") or "pulse").lower()
-    if audio_mode not in {"pulse", "memory"}:
-        raise SystemExit("AUDIO_MODE must be pulse or memory")
+    audio_mode = resolve_audio_mode(_raw("AUDIO_MODE"))
     inbound = _mode("INBOUND_MODE")
     env_path = _raw("RINGABOT_ENV_FILE")
     return Settings(
@@ -158,6 +170,7 @@ def load_settings() -> Settings:
         xai_api_base=_raw("XAI_API_BASE") or "https://api.x.ai",
         voipms_sip_server=_raw("VOIPMS_SIP_SERVER"),
         voipms_sip_user=_raw("VOIPMS_SIP_USER"),
+        sip_username=_raw("SIP_USERNAME"),
         voipms_sip_password=_raw("VOIPMS_SIP_PASSWORD"),
         voipms_did=_raw("VOIPMS_DID"),
         persona_name=_raw("PERSONA_NAME") or "Assistant",

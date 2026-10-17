@@ -1,8 +1,15 @@
 """Per-call audio paths.
 
-Production uses a PulseAudio null-sink pair at 8 kHz so the bridge only
-moves telephone audio. Tests and machines without a sound device use the
-in-process memory path. No extra media server.
+Ubuntu 24.04's baresip 1.0.0 package has alsa.so and no pulse.so. Production
+uses the kernel snd-aloop device: baresip plays and captures on
+``hw:Loopback,0,N`` and this process runs arecord/aplay on ``hw:Loopback,1,N``.
+That is one extra copy in the kernel, no Pulse daemon, and no rebuilt baresip.
+aubridge stays inside baresip, and aufile is a WAV file, so neither reaches
+the realtime socket. Substream 0 is the inbound registrar. Outbound calls take
+1 through 7.
+
+Tests and machines without a sound device use the in-process memory path.
+Pulse remains available when pulse.so is actually installed.
 """
 
 from __future__ import annotations
@@ -10,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import threading
 from dataclasses import dataclass
 
 log = logging.getLogger("ringabot.audio")
@@ -168,6 +176,99 @@ class PulseAudio:
             return
         self._pacat.stdin.write(pcm)
         await self._pacat.stdin.drain()
+
+
+_alsa_lock = threading.Lock()
+_alsa_used: set[int] = set()
+
+
+def baresip_pcm(substream: int) -> str:
+    return f"hw:Loopback,0,{substream}"
+
+
+def python_pcm(substream: int) -> str:
+    return f"hw:Loopback,1,{substream}"
+
+
+def claim_substream() -> int:
+    """Outbound substreams. 0 stays free for the inbound registrar."""
+    with _alsa_lock:
+        for number in range(1, 8):
+            if number not in _alsa_used:
+                _alsa_used.add(number)
+                return number
+    raise AudioUnavailable("alsa_substreams_full")
+
+
+def release_substream(number: int) -> None:
+    with _alsa_lock:
+        _alsa_used.discard(number)
+
+
+class AlsaLoop:
+    """8 kHz S16 mono duplex across one snd-aloop substream."""
+
+    def __init__(self, call_id: str, substream: int | None = None) -> None:
+        self.call_id = call_id
+        self.owns = substream is None
+        self.substream = claim_substream() if substream is None else substream
+        self.baresip_device = baresip_pcm(self.substream)
+        self.play_name = python_pcm(self.substream)
+        self.mic_name = python_pcm(self.substream)
+        self._capture: asyncio.subprocess.Process | None = None
+        self._playback: asyncio.subprocess.Process | None = None
+        self._stdout: asyncio.StreamReader | None = None
+
+    async def start(self) -> None:
+        if shutil.which("arecord") is None or shutil.which("aplay") is None:
+            raise AudioUnavailable("alsa-utils is not installed")
+        common = [
+            "-D",
+            self.play_name,
+            "-f",
+            "S16_LE",
+            "-r",
+            str(SAMPLE_RATE),
+            "-c",
+            "1",
+            "-t",
+            "raw",
+            "--period-time=20000",
+            "--buffer-time=80000",
+        ]
+        self._capture = await asyncio.create_subprocess_exec(
+            "arecord",
+            *common,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        self._stdout = self._capture.stdout
+        self._playback = await asyncio.create_subprocess_exec(
+            "aplay",
+            *common,
+            stdin=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+    async def stop(self) -> None:
+        await _terminate(self._capture)
+        await _terminate(self._playback)
+        if self.owns:
+            release_substream(self.substream)
+
+    async def read_remote(self) -> bytes | None:
+        if self._stdout is None:
+            return None
+        chunk = await self._stdout.read(320)
+        if not chunk:
+            return None
+        return chunk
+
+    async def write_remote(self, pcm: bytes) -> None:
+        if self._playback is None or self._playback.stdin is None:
+            return
+        self._playback.stdin.write(pcm)
+        await self._playback.stdin.drain()
 
 
 async def _terminate(proc: asyncio.subprocess.Process | None) -> None:

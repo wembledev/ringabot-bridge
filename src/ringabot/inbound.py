@@ -12,12 +12,18 @@ import json
 import logging
 import re
 
-from ringabot.audio import pulse_commands
+from ringabot.audio import baresip_pcm, pulse_commands
 from ringabot.call import CallService
 from ringabot.config import Settings
 from ringabot.credentials import resolve_credentials
 from ringabot.limits import LimitError, normalize_e164
-from ringabot.sip import SipClient, start_baresip
+from ringabot.sip import (
+    SipClient,
+    classify_registration,
+    confirm_registration,
+    registration_from_reginfo,
+    start_baresip,
+)
 from ringabot.store import Store
 
 log = logging.getLogger("ringabot.inbound")
@@ -217,9 +223,14 @@ class InboundService:
         modules: list[str] = []
         try:
             sip, baresip, modules = await self._open(creds)
-            if not await self._register(sip) or self._token is not token:
+            status = await self._register(sip)
+            if status == "closed" or self._token is not token:
                 return
-            self.registered = True
+            # pending and a hard fail both leave baresip running. A missed
+            # REGISTER_OK used to tear it down every ~10s. 401 is not a fail.
+            self.registered = status == "ok"
+            if status == "fail":
+                log.warning("sip registration rejected")
             while not self._stop.is_set() and self._token is token:
                 event = await self._wait_incoming(sip)
                 if event is None:
@@ -290,9 +301,12 @@ class InboundService:
         return greeting, briefing or "Answer the incoming call."
 
     def _devices(self) -> tuple[str, str] | None:
-        if self.settings.audio_mode == "pulse" and not self.settings.sip_ctrl:
+        if self.settings.sip_ctrl or self.settings.audio_mode == "memory":
+            return None
+        if self.settings.audio_mode == "pulse":
             return (INBOUND_PLAY, INBOUND_MIC)
-        return None
+        pcm = baresip_pcm(0)
+        return (pcm, pcm)
 
     async def _open(self, creds) -> tuple[SipClient, object | None, list[str]]:
         if self.settings.sip_ctrl:
@@ -304,16 +318,21 @@ class InboundService:
         try:
             if self.settings.audio_mode == "pulse":
                 modules = await load_pulse_sinks(INBOUND_PLAY, INBOUND_MIC)
+                play, mic, driver = INBOUND_PLAY, INBOUND_MIC, "pulse"
+            else:
+                play = mic = baresip_pcm(0)
+                driver = "alsa"
             process = await start_baresip(
                 work_root=self.settings.data_dir / "run",
                 user=creds.sip_user,
                 password=creds.sip_password,
                 server=creds.sip_server,
                 did=creds.did,
-                play_device=INBOUND_PLAY,
-                mic_device=INBOUND_MIC,
+                play_device=play,
+                mic_device=mic,
                 regint=60,
                 answermode="auto",
+                audio_driver=driver,
             )
             client = SipClient("127.0.0.1", process.port)
             await client.connect()
@@ -322,29 +341,58 @@ class InboundService:
             await unload_pulse_sinks(modules)
             raise
 
-    async def _register(self, sip: SipClient) -> bool:
+    async def _register(self, sip: SipClient) -> str:
         try:
             await sip.command("register")
         except Exception:
-            return False
-        event = await self._wait_type(sip, ("REGISTER_OK", "REGISTER_FAIL", "EOF"), 8)
-        return event is not None and event.get("type") == "REGISTER_OK"
+            return "closed"
+        return await confirm_registration(sip, 8)
 
     async def _wait_incoming(self, sip: SipClient) -> dict | None:
         while not self._stop.is_set():
-            self.waiting = True
-            try:
-                event = await self._wait_type(
-                    sip, ("CALL_INCOMING", "CALL_ESTABLISHED", "EOF", "ERROR"), 30
-                )
-            finally:
-                self.waiting = False
-            if event is None or event.get("type") in {"STOP", "EOF", "ERROR"}:
+            event = await self._next_event(sip, 30)
+            kind = event.get("type")
+            if kind in {"STOP", "EOF", "ERROR"}:
                 return None
-            if event.get("type") == "TIMEOUT":
+            if kind == "TIMEOUT":
+                try:
+                    await sip.command("reginfo")
+                except Exception:
+                    return None
                 continue
-            return event
+            if kind == "REGISTER_OK" or registration_from_reginfo(event) == "ok":
+                self.registered = True
+                continue
+            if kind == "REGISTER_FAIL":
+                if classify_registration(event) == "challenge":
+                    continue
+                self.registered = False
+                continue
+            if registration_from_reginfo(event) == "fail":
+                self.registered = False
+                continue
+            if kind in {"CALL_INCOMING", "CALL_ESTABLISHED"}:
+                return event
         return None
+
+    async def _next_event(self, sip: SipClient, timeout: float) -> dict:
+        wait = asyncio.create_task(sip.events.get())
+        stop = asyncio.create_task(self._stop.wait())
+        self.waiting = True
+        try:
+            done, _pending = await asyncio.wait(
+                {wait, stop}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            self.waiting = False
+            for task in (wait, stop):
+                if not task.done():
+                    task.cancel()
+        if wait in done and not wait.cancelled():
+            return wait.result()
+        if stop in done and not stop.cancelled():
+            return {"type": "STOP"}
+        return {"type": "TIMEOUT"}
 
     async def _wait_established(self, sip: SipClient) -> dict | None:
         event = await self._wait_type(sip, ("CALL_ESTABLISHED", "CALL_CLOSED", "EOF"), 2)

@@ -45,7 +45,9 @@ Plain HTTP, same token:
 
 ## Quick start
 
-You need Python 3.12, [uv](https://docs.astral.sh/uv/), and on Linux the `baresip` and `pulseaudio` packages. Calls use 8 kHz PCM so the box mostly just forwards audio.
+You need Python 3.12, [uv](https://docs.astral.sh/uv/), and on Linux the `baresip` and `alsa-utils` packages. Calls use 8 kHz PCM so the box mostly just forwards audio.
+
+Ubuntu 24.04's apt package is baresip 1.0.0. `baresip -n` without an interface name exits immediately, so the bridge does not pass `-n`. `pulse.so` is not in `baresip-core` (it ships in `baresip-x11`, which `--no-install-recommends` does not install) and it still needs a PulseAudio daemon. Audio uses the kernel `snd-aloop` device and the `alsa.so` from the core package: baresip plays and captures on `hw:Loopback,0,N`, and the bridge runs `arecord` / `aplay` on `hw:Loopback,1,N` at 8 kHz, 16-bit, mono, with a 20 ms period. That is one copy in the kernel and no Pulse daemon, which matters on a 1 GB Nanode. `aubridge` never leaves the baresip process, `aufile` is a WAV file rather than a live duplex stream, and building a newer baresip is a compiler and a lot of RAM at install time. `AUDIO_MODE=pulse` is used only when `pulse.so` is on disk; otherwise it is treated as `alsa`. `AUDIO_MODE=memory` skips the sound device.
 
 ```bash
 uv sync
@@ -69,7 +71,7 @@ chown ringabot:ringabot /etc/ringabot/master.key
 
 `/etc/ringabot/ringabot.env` should be mode `0600` and owned by the service user. `ringabot doctor` checks that file, then (without `--offline`) the xAI key, a SIP REGISTER, and the public TLS handshake.
 
-`AUDIO_MODE=memory` skips PulseAudio. Point `SIP_CTRL` at a fake user agent if you are measuring the process without a sound card or a carrier.
+Point `SIP_CTRL` at a fake user agent if you are measuring the process without a sound card or a carrier. `SIP_USERNAME` is the Voip.ms sub-account. `VOIPMS_DID` is only the caller ID. Values in `/etc/ringabot/ringabot.env` are double-quoted so a persona name with spaces survives systemd.
 
 ## Voip.ms
 
@@ -79,7 +81,7 @@ Do this in your own Voip.ms account. The screens in that portal move; these are 
 2. Order a DID (a phone number). Emergency-address service on that number is between you and Voip.ms. This bridge still will not place emergency calls.
 3. Create a SIP sub-account. Main account → Sub Accounts → Create Sub Account. Note the pop hostname (the SIP server), the username, and the password. Use a city pop close to the VPS.
 4. Route the DID to that sub-account. DID Numbers → Manage DIDs → the number → Routing. Choose the sub-account, not a voicemail box or an IVR. Inbound calls then land on the registered user agent. Set the DID's caller ID to the same number so outbound calls show that caller ID.
-5. Put the pop hostname, username, password, and DID (`+` and country code) in the env file, or pass them to `connect_number`.
+5. Put the pop hostname, sub-account username (`SIP_USERNAME` or `VOIPMS_SIP_USER`), password, and DID (`+` and country code, `VOIPMS_DID`) in the env file, or pass them to `connect_number`. The username is the REGISTER identity. The DID is not.
 
 Example values in this repo use fictional `555` numbers such as `+15555550100` and hostnames like `sip.example.com`. Use the hostname Voip.ms shows you, not an example.
 
@@ -108,6 +110,22 @@ Checklist for a fresh Linode created from `deploy/stackscript.sh`. Do the Voip.m
    `allow` is optional. Leave it empty to answer any caller. Pass E.164 numbers such as `["+15555550123"]` to only answer those callers. Anyone else is hung up and is not connected to the voice agent. `get_setup_status` then shows `inbound.enabled` and `inbound.registered`.
 6. Call the DID from a phone. baresip auto-answers. The first thing spoken is the AI disclosure (and a recording clause if `RECORDINGS=on`), then the greeting. The call is stored in SQLite. When it ends, the bridge says goodbye, writes the summary, and POSTs `call.completed` if a webhook is configured. `get_call` returns the transcript.
 7. Optional outbound check: `place_call` to a number on `ALLOWED_DESTINATIONS` that is expecting you. The same disclosure, idle timeout, max length, and summary apply. Inbound and outbound share the daily cap and the one-active-call limit.
+
+## Check a box that would not register
+
+On the Nanode, after pulling this branch (or re-running the StackScript against it):
+
+```bash
+sudo modprobe snd-aloop
+grep Loopback /proc/asound/cards
+sudo usermod -aG audio ringabot
+sudo systemctl restart ringabot
+sudo -u ringabot /opt/ringabot/.venv/bin/ringabot doctor
+```
+
+`/etc/ringabot/ringabot.env` should quote values (`PERSONA_NAME="Example Assistant"`) and set `AUDIO_MODE=alsa`. `SIP_USERNAME` is the sub-account. In the live account file under `/var/lib/ringabot/run/baresip-*/accounts`, the URI is `sip:<username>@<pop>` and the DID is only the display name in quotes. `ps -C baresip` should keep showing one process; the old build started a new one about every 10 seconds because it never saw `REGISTER_OK`. `journalctl -u ringabot -n 50` should not be a restart loop.
+
+`sip_listen` is `0.0.0.0:0`, so the contact port changes each time baresip starts. Replies to REGISTER match the existing UDP flow. A test call that rings but stays silent is usually RTP from the pop, which is a new UDP flow; allow that pop if the firewall drops it. Ports 80 and 443 are opened only when `PUBLIC_HOSTNAME` is set.
 
 ## Connect a Grok bot
 

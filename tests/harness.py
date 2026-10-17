@@ -8,6 +8,8 @@ import json
 
 import websockets
 
+from ringabot.sip import drain_frames
+
 
 class _SipPeer:
     def __init__(self, writer: asyncio.StreamWriter) -> None:
@@ -18,6 +20,7 @@ class _SipPeer:
 class FakeSipServer:
     def __init__(self) -> None:
         self.commands: list[str] = []
+        self.auto_register = True
         self._server: asyncio.Server | None = None
         self._peers: list[_SipPeer] = []
         self.port = 0
@@ -28,6 +31,8 @@ class FakeSipServer:
         self.port = socket.getsockname()[1]
 
     async def stop(self) -> None:
+        for peer in list(self._peers):
+            peer.writer.close()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -53,27 +58,42 @@ class FakeSipServer:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = _SipPeer(writer)
         self._peers.append(peer)
+        buf = bytearray()
         try:
             while True:
-                line = await reader.readline()
-                if not line:
+                chunk = await reader.read(4096)
+                if not chunk:
                     break
-                text = line.decode("utf-8", "replace").strip()
-                if not text:
-                    continue
-                self.commands.append(text)
-                if text.startswith("dial "):
-                    writer.write(b'{"type":"CALL_RINGING"}\n{"type":"CALL_ESTABLISHED"}\n')
-                elif text == "hangup":
-                    writer.write(b'{"type":"CALL_CLOSED","reason":"local"}\n')
-                elif text == "register":
-                    peer.registered = True
-                    writer.write(b'{"type":"REGISTER_OK"}\n')
-                elif text == "accept":
-                    writer.write(b'{"type":"CALL_ESTABLISHED"}\n')
-                else:
-                    writer.write(b'{"type":"ERROR","reason":"unknown"}\n')
-                await writer.drain()
+                buf.extend(chunk)
+                for frame in drain_frames(buf):
+                    text = frame.decode("utf-8", "replace").strip()
+                    if not text:
+                        continue
+                    if text.startswith("{"):
+                        try:
+                            payload = json.loads(text)
+                        except json.JSONDecodeError:
+                            payload = None
+                        if isinstance(payload, dict) and payload.get("command"):
+                            params = payload.get("params") or ""
+                            command = str(payload["command"])
+                            text = f"{command} {params}".strip() if params else command
+                    self.commands.append(text)
+                    if text.startswith("dial "):
+                        writer.write(b'{"type":"CALL_RINGING"}\n{"type":"CALL_ESTABLISHED"}\n')
+                    elif text == "hangup":
+                        writer.write(b'{"type":"CALL_CLOSED","reason":"local"}\n')
+                    elif text == "register":
+                        if self.auto_register:
+                            peer.registered = True
+                            writer.write(b'{"type":"REGISTER_OK"}\n')
+                    elif text == "accept":
+                        writer.write(b'{"type":"CALL_ESTABLISHED"}\n')
+                    elif text == "reginfo":
+                        writer.write(b'{"response":true,"ok":true,"data":"OK"}\n')
+                    else:
+                        writer.write(b'{"type":"ERROR","reason":"unknown"}\n')
+                    await writer.drain()
         finally:
             if peer in self._peers:
                 self._peers.remove(peer)

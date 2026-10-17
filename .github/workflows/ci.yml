@@ -23,6 +23,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --frozen --all-groups
+      - name: install distro baresip 1.0.0
+        run: sudo apt-get update && sudo apt-get install -y baresip
       - run: uv run pytest
 
   gitleaks:

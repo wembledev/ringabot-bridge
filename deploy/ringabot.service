@@ -7,11 +7,12 @@ Wants=network-online.target
 Type=simple
 User=ringabot
 Group=ringabot
+SupplementaryGroups=audio
 EnvironmentFile=/etc/ringabot/ringabot.env
 Environment=XDG_RUNTIME_DIR=/run/ringabot
 RuntimeDirectory=ringabot
 WorkingDirectory=/opt/ringabot
-ExecStartPre=/usr/bin/pulseaudio -D --exit-idle-time=-1
+ExecStartPre=-+/sbin/modprobe snd-aloop
 ExecStart=/opt/ringabot/.venv/bin/ringabot serve
 Restart=on-failure
 RestartSec=2
