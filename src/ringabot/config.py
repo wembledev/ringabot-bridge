@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 
-DEFAULT_INSTRUCTIONS = (
-    "You are a friendly phone assistant. Keep answers short and natural for a phone call. "
-    "When the conversation is over, say a short goodbye yourself and then use the end_call "
-    "tool. Never use end_call just because the other person said goodbye or hang up."
-)
-DEFAULT_GREETING = "Say you are an AI assistant, not a human, then ask how you can help."
+# Persona from the Oct 16 outbound test call (the one that sounded best).
+DEFAULT_PERSONA_NAME = "Assistant"
+DEFAULT_VOICE = "aurora"
+DEFAULT_NOTES = "Be brief and polite."
 
 
 def _int(env: dict[str, str], name: str, default: int) -> int:
@@ -34,9 +31,10 @@ class Settings:
     sip_allowed_cidrs: list[str] = field(default_factory=list)
     host: str = "127.0.0.1"
     port: int = 8787
-    voice: str = "eve"
-    instructions: str = DEFAULT_INSTRUCTIONS
-    greeting: str = DEFAULT_GREETING
+    persona_name: str = DEFAULT_PERSONA_NAME
+    voice: str = DEFAULT_VOICE
+    instructions: str = DEFAULT_NOTES
+    greeting: str = ""
     max_call_seconds: int = 600
     idle_seconds: int = 30
     max_concurrent_calls: int = 2
@@ -54,10 +52,6 @@ class Settings:
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
         env = dict(os.environ if env is None else env)
-        instructions = (env.get("INSTRUCTIONS") or "").strip()
-        ifile = (env.get("INSTRUCTIONS_FILE") or "").strip()
-        if not instructions and ifile:
-            instructions = Path(ifile).read_text(encoding="utf-8").strip()
         return cls(
             xai_api_key=(env.get("XAI_API_KEY") or "").strip(),
             webhook_secret=(env.get("XAI_WEBHOOK_SECRET") or "").strip(),
@@ -68,9 +62,10 @@ class Settings:
             sip_allowed_cidrs=_list(env, "SIP_ALLOWED_CIDRS"),
             host=(env.get("HOST") or "127.0.0.1").strip(),
             port=_int(env, "PORT", 8787),
-            voice=(env.get("VOICE") or "eve").strip(),
-            instructions=instructions or DEFAULT_INSTRUCTIONS,
-            greeting=(env.get("GREETING") or "").strip() or DEFAULT_GREETING,
+            persona_name=(env.get("PERSONA_NAME") or "").strip() or DEFAULT_PERSONA_NAME,
+            voice=(env.get("VOICE") or "").strip() or DEFAULT_VOICE,
+            instructions=(env.get("INSTRUCTIONS") or "").strip() or DEFAULT_NOTES,
+            greeting=(env.get("GREETING") or "").strip(),
             max_call_seconds=_int(env, "MAX_CALL_SECONDS", 600),
             idle_seconds=_int(env, "IDLE_TIMEOUT", 30),
             max_concurrent_calls=_int(env, "MAX_CONCURRENT_CALLS", 2),

@@ -130,12 +130,15 @@ async def test_outbound_end_call_hangs_up_sip_leg(settings):
 
 
 def test_inbound_and_outbound_share_persona(settings):
-    from ringabot.calls import greeting_event, session_config
+    from ringabot.calls import DISCLOSURE, opening_event, session_config
 
-    inbound = session_config(settings)["session"]
-    outbound = session_config(settings, "Ask about lunch", {"input": {}})["session"]
+    inbound = session_config(settings, inbound=True)["session"]
+    outbound = session_config(settings, "Ask about lunch")["session"]
     for key in ("voice", "turn_detection", "tools"):
         assert inbound[key] == outbound[key]
-    assert outbound["instructions"].startswith(inbound["instructions"])
+    assert inbound["voice"] == "aurora"
+    assert "Be brief and polite." in inbound["instructions"]
     assert "Ask about lunch" in outbound["instructions"]
-    assert settings.greeting in greeting_event(settings, "x")["response"]["instructions"]
+    assert "audio" in outbound and "audio" not in inbound
+    text = opening_event(settings)["item"]["content"][0]["text"]
+    assert text.startswith(DISCLOSURE)

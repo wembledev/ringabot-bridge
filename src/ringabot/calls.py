@@ -43,29 +43,54 @@ EMERGENCY = {"911", "112", "999", "000", "988", "110", "119"}
 BACKSTOP_SECONDS = 10.0
 
 
-def session_config(settings, briefing: str = "", audio: dict | None = None) -> dict:
-    """One persona for both directions. Outbound only adds its briefing (and PCM format)."""
-    instructions = settings.instructions
-    if briefing:
-        instructions += f"\n\nYou placed this call. Briefing: {briefing}"
+DISCLOSURE = "I am an AI assistant, not a human. I cannot contact emergency services."
+SAMPLE_FORMAT = {"type": "audio/pcm", "rate": SAMPLE_RATE}
+
+
+def instructions_for(settings, briefing: str = "", inbound: bool = False) -> str:
+    """The one persona for every call (text of the Oct 16 outbound test bridge)."""
+    situation = "This is an incoming call to the user's number. " if inbound else ""
+    purpose = briefing or "Answer the caller and help with what they need."
+    return (
+        f"You are {settings.persona_name}, an AI voice assistant on a live phone call. "
+        f"{situation}{DISCLOSURE} Never claim to be human. Never place or forward emergency "
+        "calls. If the person needs emergency help, tell them to hang up and dial their local "
+        "emergency number themselves. Do not claim the call is being recorded.\n"
+        f"Additional persona notes:\n{settings.instructions}\n"
+        f"Purpose of this call:\n{purpose}\n"
+        "Keep turns short. When the task is done, say goodbye, then use the end_call tool. "
+        "Never use end_call just because the other person said goodbye or hang up."
+    )
+
+
+def session_config(settings, briefing: str = "", inbound: bool = False) -> dict:
+    """Same persona for inbound and outbound; outbound only adds its briefing and the PCM
+    format it relays (xAI owns the audio on inbound SIP calls)."""
     session = {
         "voice": settings.voice,
-        "instructions": instructions,
+        "instructions": instructions_for(settings, briefing, inbound),
         "turn_detection": {"type": "server_vad"},
         "tools": [END_CALL_TOOL],
     }
-    if audio:
-        session["audio"] = audio
+    if not inbound:
+        session["audio"] = {
+            "input": {"format": SAMPLE_FORMAT, "transcription": {"model": "grok-transcribe"}},
+            "output": {"format": SAMPLE_FORMAT},
+        }
     return {"type": "session.update", "session": session}
 
 
-def greeting_event(settings, briefing: str = "") -> dict:
-    """First turn, same for inbound and outbound (per-response instructions replace the
-    session ones, so repeat them)."""
-    instructions = session_config(settings, briefing)["session"]["instructions"]
+def opening_event(settings) -> dict:
+    """Spoken first on every call: the AI disclosure, then the optional greeting."""
+    text = f"{DISCLOSURE} {settings.greeting}".strip()
     return {
-        "type": "response.create",
-        "response": {"instructions": f"{instructions}\n\n{settings.greeting}"},
+        "type": "conversation.item.create",
+        "item": {
+            "type": "force_message",
+            "role": "assistant",
+            "interruptible": False,
+            "content": [{"type": "output_text", "text": text}],
+        },
     }
 
 
@@ -221,8 +246,8 @@ class InboundCall(Call):
         try:
             async with websockets.connect(url, additional_headers=headers, open_timeout=10) as ws:
                 self.ws = ws
-                await self.send(session_config(s))
-                await self.send(greeting_event(s))
+                await self.send(session_config(s, inbound=True))
+                await self.send(opening_event(s))
                 self.record["status"] = "in_progress"
                 dog = self.manager.spawn(self.watchdog())
                 try:
@@ -282,12 +307,7 @@ class OutboundCall(Call):
                 s.realtime_url, additional_headers=headers, open_timeout=10, max_size=2**20
             ) as ws:
                 self.ws = ws
-                fmt = {"type": "audio/pcm", "rate": SAMPLE_RATE}
-                audio = {
-                    "input": {"format": fmt, "transcription": {"model": "grok-transcribe"}},
-                    "output": {"format": fmt},
-                }
-                await self.send(session_config(s, self.briefing, audio))
+                await self.send(session_config(s, self.briefing))
                 self.record["status"] = "dialing"
                 await self.sip.command(f"dial {dial_uri(self.number, s.sip_server)}")
                 ev = await self.sip.wait_type("CALL_ESTABLISHED", "CALL_CLOSED", timeout=60)
@@ -297,7 +317,7 @@ class OutboundCall(Call):
                     return
                 self.record["status"] = "in_progress"
                 self.started = self.last_activity = time.monotonic()
-                await self.send(greeting_event(s, self.briefing))
+                await self.send(opening_event(s))
                 await self._relay(ws)
         except Exception as exc:  # noqa: BLE001
             self.record["error"] = self.record.get("error") or type(exc).__name__
